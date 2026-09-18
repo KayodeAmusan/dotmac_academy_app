@@ -2,6 +2,7 @@
 
 from unittest.mock import MagicMock
 
+import pytest
 from sqlalchemy import select
 
 from app.config import settings
@@ -10,6 +11,7 @@ from app.models.course import Course
 from app.models.lab import LabInstance, LabTemplate
 from app.models.person import Person
 from app.services import lab_lifecycle
+from app.services.exceptions import ConflictError
 from app.services.labengine.interface import ExecResult, LabHandle
 
 # The autouse ``_no_real_console_spawn`` fixture in tests/conftest.py replaces
@@ -160,6 +162,173 @@ def test_provision_records_error_on_failure(admin_session, tenant_a):
     admin_session.flush()
     assert out.status == "error"
     assert "boom" in out.error
+    admin_session.rollback()
+
+
+def test_reset_success_sets_active_clears_error_and_updates_last_active(admin_session, tenant_a):
+    _c, act, lt, p = _seed(admin_session, tenant_a.id)
+    inst = LabInstance(tenant_id=tenant_a.id, activity_id=act.id, person_id=p.id,
+                       instance_name="dal-reset-ok", seed={"o": 5}, status="error",
+                       error="stale failure from a prior reset",
+                       consoles={"client": {"kind": "linux", "mgmt": "172.20.20.9"}})
+    admin_session.add(inst)
+    admin_session.flush()
+    engine = MagicMock()
+    engine.reset.return_value = LabHandle(
+        instance_name="dal-reset-ok", nodes={"client": "clab-dal-reset-ok-client"},
+        mgmt={"client": "172.20.20.3"}, kinds={"client": "linux"})
+    out = lab_lifecycle.reset(admin_session, inst, engine, lt)
+    admin_session.flush()
+    assert out.status == "active"
+    assert out.error is None
+    assert out.last_active_at is not None
+    engine.reset.assert_called_once()
+    admin_session.rollback()
+
+
+def test_reset_applies_topology_name_before_calling_engine(admin_session, tenant_a):
+    """reset() must apply _set_topology_name() the same way provision() does,
+    so the redeployed containers still follow the clab-<instance>-<node>
+    convention handle_for expects — a raw interpolate() with no name override
+    would leave the topology's original `name:` (or none) in place."""
+    _c, act, lt, p = _seed(admin_session, tenant_a.id)
+    inst = LabInstance(tenant_id=tenant_a.id, activity_id=act.id, person_id=p.id,
+                       instance_name="dal-reset-name", seed={"o": 5}, status="active",
+                       consoles={})
+    admin_session.add(inst)
+    admin_session.flush()
+    engine = MagicMock()
+    engine.reset.return_value = LabHandle(
+        instance_name="dal-reset-name", nodes={"client": "clab-dal-reset-name-client"},
+        mgmt={"client": "172.20.20.3"}, kinds={"client": "linux"})
+    lab_lifecycle.reset(admin_session, inst, engine, lt)
+    admin_session.flush()
+    topology_text_used = engine.reset.call_args[0][0]
+    assert "name: dal-reset-name" in topology_text_used
+    admin_session.rollback()
+
+
+def test_reset_success_rebuilds_consoles_from_fresh_handle(admin_session, tenant_a):
+    """A successful reset must not leave stale mgmt/console data on the row —
+    engine.reset() can return different mgmt IPs/ports on redeploy."""
+    _c, act, lt, p = _seed(admin_session, tenant_a.id)
+    inst = LabInstance(tenant_id=tenant_a.id, activity_id=act.id, person_id=p.id,
+                       instance_name="dal-reset-consoles", seed={"o": 5}, status="active",
+                       consoles={"client": {"kind": "linux", "mgmt": "172.20.20.9", "port": 1111}})
+    admin_session.add(inst)
+    admin_session.flush()
+    engine = MagicMock()
+    engine.reset.return_value = LabHandle(
+        instance_name="dal-reset-consoles",
+        nodes={"client": "clab-dal-reset-consoles-client", "r1": "clab-dal-reset-consoles-r1"},
+        mgmt={"client": "172.20.20.55", "r1": "172.20.20.2"},
+        kinds={"client": "linux", "r1": "vr-ros"})
+    out = lab_lifecycle.reset(admin_session, inst, engine, lt)
+    admin_session.flush()
+    # Fresh mgmt IP replaces the stale one, and a node that didn't exist
+    # before the reset is now present.
+    assert out.consoles["client"]["mgmt"] == "172.20.20.55"
+    assert "r1" in out.consoles
+    assert "port" not in out.consoles["r1"]  # RouterOS gets webfig, not ttyd
+    admin_session.rollback()
+
+
+def test_reset_stops_old_consoles_before_starting_fresh_ones(admin_session, tenant_a, monkeypatch):
+    """stop_consoles() matches running ttyd processes by instance.id alone (not
+    by port), so it MUST run before the fresh start_console() calls — calling
+    it after would kill the just-started consoles for the same instance."""
+    _c, act, lt, p = _seed(admin_session, tenant_a.id)
+    inst = LabInstance(tenant_id=tenant_a.id, activity_id=act.id, person_id=p.id,
+                       instance_name="dal-reset-order", seed={"o": 5}, status="active",
+                       consoles={"client": {"kind": "linux", "mgmt": "172.20.20.9", "port": 1111}})
+    admin_session.add(inst)
+    admin_session.flush()
+
+    calls: list[str] = []
+    monkeypatch.setattr(lab_lifecycle, "stop_consoles", lambda i: calls.append("stop") or 1)
+
+    def _fake_start_console(cname, base_path):
+        calls.append("start")
+        return 9999
+
+    monkeypatch.setattr(lab_lifecycle, "start_console", _fake_start_console)
+    engine = MagicMock()
+    engine.reset.return_value = LabHandle(
+        instance_name="dal-reset-order", nodes={"client": "clab-dal-reset-order-client"},
+        mgmt={"client": "172.20.20.55"}, kinds={"client": "linux"})
+    out = lab_lifecycle.reset(admin_session, inst, engine, lt)
+    admin_session.flush()
+
+    assert calls == ["stop", "start"]
+    assert out.consoles["client"]["port"] == 9999
+    admin_session.rollback()
+
+
+def test_reset_refuses_a_reaped_instance_without_touching_the_engine(admin_session, tenant_a):
+    _c, act, lt, p = _seed(admin_session, tenant_a.id)
+    inst = LabInstance(tenant_id=tenant_a.id, activity_id=act.id, person_id=p.id,
+                       instance_name="dal-reaped", seed={"o": 5}, status="reaped",
+                       consoles={})
+    admin_session.add(inst)
+    admin_session.flush()
+    engine = MagicMock()
+
+    with pytest.raises(ConflictError):
+        lab_lifecycle.reset(admin_session, inst, engine, lt)
+    engine.reset.assert_not_called()
+    admin_session.rollback()
+
+
+def test_reset_refuses_a_queued_instance_without_touching_the_engine(admin_session, tenant_a):
+    """queued is lab_jobs.drain_once()'s capacity-controlled deployment path —
+    resetting a queued instance directly would deploy it immediately and
+    bypass MAX_CONCURRENT_LABS entirely."""
+    _c, act, lt, p = _seed(admin_session, tenant_a.id)
+    inst = LabInstance(tenant_id=tenant_a.id, activity_id=act.id, person_id=p.id,
+                       instance_name="dal-queued", seed={"o": 5}, status="queued",
+                       consoles={})
+    admin_session.add(inst)
+    admin_session.flush()
+    engine = MagicMock()
+
+    with pytest.raises(ConflictError):
+        lab_lifecycle.reset(admin_session, inst, engine, lt)
+    engine.reset.assert_not_called()
+    admin_session.rollback()
+
+
+def test_reset_refuses_a_provisioning_instance_without_touching_the_engine(admin_session, tenant_a):
+    """provisioning means the worker's own provision() may be running against
+    this exact row/work directory right now — resetting it too would race
+    that in-flight deploy."""
+    _c, act, lt, p = _seed(admin_session, tenant_a.id)
+    inst = LabInstance(tenant_id=tenant_a.id, activity_id=act.id, person_id=p.id,
+                       instance_name="dal-provisioning", seed={"o": 5}, status="provisioning",
+                       consoles={})
+    admin_session.add(inst)
+    admin_session.flush()
+    engine = MagicMock()
+
+    with pytest.raises(ConflictError):
+        lab_lifecycle.reset(admin_session, inst, engine, lt)
+    engine.reset.assert_not_called()
+    admin_session.rollback()
+
+
+def test_reset_failure_records_error_and_does_not_raise(admin_session, tenant_a):
+    _c, act, lt, p = _seed(admin_session, tenant_a.id)
+    inst = LabInstance(tenant_id=tenant_a.id, activity_id=act.id, person_id=p.id,
+                       instance_name="dal-reset-err", seed={"o": 5}, status="active",
+                       consoles={})
+    admin_session.add(inst)
+    admin_session.flush()
+    engine = MagicMock()
+    engine.reset.side_effect = RuntimeError("engine boom")
+    # Must not raise out of the service function.
+    out = lab_lifecycle.reset(admin_session, inst, engine, lt)
+    admin_session.flush()
+    assert out.status == "error"
+    assert "engine boom" in out.error
     admin_session.rollback()
 
 

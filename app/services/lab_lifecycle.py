@@ -27,6 +27,7 @@ from app.config import settings
 from app.models.assessment import Activity, Score, Submission
 from app.models.lab import LabInstance, LabTemplate
 from app.services.checks.engine import run_checks
+from app.services.exceptions import ConflictError
 from app.services.lab_seed import generate_seed, interpolate
 from app.services.labengine.interface import LabEngine, LabHandle
 
@@ -384,9 +385,70 @@ def grade(db: Session, instance: LabInstance, engine: LabEngine, template: LabTe
 
 
 def reset(db: Session, instance: LabInstance, engine: LabEngine, template: LabTemplate) -> LabInstance:
-    """Tear down and redeploy the instance topology in place (fresh state)."""
-    engine.reset(interpolate(template.topology, instance.seed), instance.instance_name)
-    instance.last_active_at = _now()
+    """Tear down and redeploy the instance topology in place (fresh state).
+
+    Only ``active`` or ``error`` (a previously-failed deploy, retryable) may
+    be reset; every other status is refused up front, before any engine
+    interaction. This is an allow-list, not just a reaped exclusion:
+    ``queued``/``provisioning`` are the capacity-controlled deployment path
+    owned by ``lab_jobs.drain_once()`` (which enforces ``MAX_CONCURRENT_LABS``
+    before calling ``provision()``) — resetting a ``queued`` instance would
+    deploy it immediately and bypass that cap entirely, and resetting a
+    ``provisioning`` one would race the worker's own ``provision()`` call on
+    the same row/work directory. ``reaped`` (already-destroyed) is refused
+    because a successful reset unconditionally sets ``status="active"``,
+    which would resurrect it. This guard lives here — not in the web route —
+    so it applies to every current and future caller of ``reset()``, not just
+    the one route that exists today.
+
+    Mirrors ``provision``'s guarded-deploy shape and its topology preparation:
+    ``_set_topology_name()`` is applied the same way so the redeployed
+    container names still follow the ``clab-<instance>-<node>`` convention
+    ``handle_for`` expects — a reset that skipped this could deploy under the
+    wrong name and silently desync from every other reader of ``consoles``.
+    An engine/interpolation failure is recorded onto the row
+    (``status="error"``) rather than propagating out as an unhandled
+    exception — the caller (the reset route) always gets a normal return to
+    render, in either outcome. Only the ``db.flush()`` itself is left
+    unguarded, since a database/transaction failure is not something this
+    function can meaningfully paper over.
+
+    Old ttyd consoles are stopped BEFORE the fresh ones are started —
+    mirroring ``destroy()``'s ordering — because ``stop_consoles()`` matches
+    processes by ``instance.id`` alone (see ``console_pids()``), not by the
+    specific port each one was launched on. Calling it after starting the new
+    consoles would kill the ones just spawned for the same instance, since
+    they're indistinguishable from the old ones by that pattern.
+
+    On success, ``instance.consoles`` is rebuilt from the fresh
+    :class:`LabHandle` ``engine.reset()`` returns (mgmt IPs and console ports
+    can change on redeploy) — the same node/console-spawn loop ``provision``
+    uses, so a "successful" reset never leaves stale console/mgmt data on the
+    row.
+    """
+    if instance.status not in ("active", "error"):
+        raise ConflictError(f"cannot reset a lab instance with status {instance.status!r}")
+    try:
+        stop_consoles(instance)
+        topology_text = _set_topology_name(interpolate(template.topology, instance.seed), instance.instance_name)
+        handle = engine.reset(topology_text, instance.instance_name)
+        consoles: dict = {}
+        for node in handle.nodes:
+            kind = handle.kinds.get(node)
+            spec = {"kind": kind, "mgmt": handle.mgmt.get(node)}
+            if _is_linux_kind(kind):
+                spec["port"] = start_console(
+                    handle.nodes[node],
+                    f"{_CONSOLE_BASE}{instance.id}/console/{node}",
+                )
+            consoles[node] = spec
+        instance.consoles = consoles
+        instance.status = "active"
+        instance.last_active_at = _now()
+        instance.error = None
+    except Exception as exc:  # surface any deploy failure onto the row
+        instance.status = "error"
+        instance.error = str(exc)
     db.flush()
     return instance
 
