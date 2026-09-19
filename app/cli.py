@@ -857,35 +857,76 @@ def _recompute_entrance_levels(args: argparse.Namespace) -> None:
 
 
 def _lab_worker(args: argparse.Namespace) -> None:
-    from app.config import settings
-    from app.services import lab_jobs
+    import shutil
+
+    from app.config import settings, validate_settings
+    from app.services import lab_jobs, lab_operations
     from app.services.labengine.containerlab import ContainerlabEngine
 
+    if settings.lab_host_role.lower() != "lab":
+        raise SystemExit("lab-worker requires LAB_HOST_ROLE=lab")
+    if shutil.which("containerlab") is None:
+        raise SystemExit("lab-worker requires containerlab on PATH")
+    errors = validate_settings(settings)
+    if errors:
+        raise SystemExit("; ".join(errors))
     engine = ContainerlabEngine(settings.lab_workdir)
-    print("lab-worker started; draining pending labs every 5s")
+    print("lab-worker started; draining durable operations every 5s")
     while True:
-        with lab_jobs.admin_session() as db:
+        with lab_jobs.lab_worker_session() as db:
+            repaired = lab_operations.reconcile_stuck(db)
+            db.commit()
             n = lab_jobs.drain_once(db, engine)
+        if repaired:
+            print(f"reconciled {repaired} lab operation(s)")
         if n:
             print(f"provisioned {n} lab(s)")
         time.sleep(5)
 
 
 def _reap_labs(args: argparse.Namespace) -> None:
-    from app.config import settings
     from app.services import lab_jobs
+
+    with lab_jobs.admin_session() as db:
+        requested = lab_jobs.request_idle_reaps(db)
+    print(f"enqueued {requested} idle lab destroy operation(s)")
+
+
+def _lab_reconcile(args: argparse.Namespace) -> None:
+    import shutil
+
+    from app.config import settings, validate_settings
+    from app.services import lab_jobs, lab_operations
     from app.services.labengine.containerlab import ContainerlabEngine
 
+    if settings.lab_host_role.lower() != "lab":
+        raise SystemExit("lab-reconcile requires LAB_HOST_ROLE=lab")
+    if shutil.which("containerlab") is None:
+        raise SystemExit("lab-reconcile requires containerlab on PATH")
+    errors = validate_settings(settings)
+    if errors:
+        raise SystemExit("; ".join(errors))
     engine = ContainerlabEngine(settings.lab_workdir)
-    with lab_jobs.admin_session() as db:
-        reaped = lab_jobs.reap_idle(db, engine)
-        # After reaping, so a console this run just tore down is already gone and
-        # only genuine leftovers remain.
+    with lab_jobs.lab_worker_session() as db:
+        requeued = lab_operations.reconcile_stuck(db)
+        # Commit the stuck-claim reconciliation in its own short transaction —
+        # its FOR UPDATE SKIP LOCKED scan takes a row lock on every currently
+        # claimed operation (not just the stuck ones; "stuck" is decided in
+        # Python after the rows are already locked), so holding it open through
+        # reconcile_runtime's live containerlab inspect/destroy calls would
+        # block a healthy worker's heartbeat()/_settle() UPDATE on those same
+        # rows for the duration of that external work. _lab_worker's loop
+        # already commits between reconcile_stuck and drain_once for the same
+        # reason.
+        db.commit()
+        runtime_repairs, destroyed_orphans = lab_jobs.reconcile_runtime(db, engine)
         orphans = lab_jobs.sweep_orphan_consoles(db)
-        provisioned = lab_jobs.drain_once(db, engine)
+        db.commit()
     print(
-        f"reaped {reaped} idle lab(s); killed {orphans} orphan console(s); "
-        f"provisioned {provisioned} pending lab(s)"
+        f"reconciled {requeued} expired/cutover operation(s); "
+        f"queued {runtime_repairs} runtime repair(s); "
+        f"destroyed {destroyed_orphans} rowless lab(s); "
+        f"killed {orphans} orphan console(s)"
     )
 
 
@@ -1156,11 +1197,11 @@ def main() -> None:
 
     lw = sub.add_parser(
         "lab-worker",
-        help="Run the cross-tenant provisioning worker loop (deploys pending labs).",
+        help="Run the cross-tenant durable lab-operation worker.",
         description=(
-            "Long-running background worker: every ~5s, opens an app_admin "
-            "(BYPASSRLS) session and deploys the oldest queued/provisioning lab "
-            "instances across all tenants, up to MAX_CONCURRENT_LABS. Intended to "
+            "Long-running background worker: every ~5s, opens an academy_lab_worker "
+            "(BYPASSRLS) session and claims queued lab operations across all tenants. "
+            "It must run with LAB_HOST_ROLE=lab on the containerlab host. Intended to "
             "run under systemd (academy-lab-worker.service, Restart=always)."
         ),
     )
@@ -1168,23 +1209,26 @@ def main() -> None:
 
     rl = sub.add_parser(
         "reap-labs",
-        help="One-shot: destroy idle lab instances, sweep orphan consoles, drain pending.",
+        help="One-shot: enqueue destroy operations for idle lab instances.",
         description=(
-            "Reap active lab instances idle longer than LAB_IDLE_MINUTES (marking "
-            "them 'reaped'), kill any ttyd console whose instance is no longer live, "
-            "then drain any pending instances. Intended to run on a timer "
-            "(academy-reap-labs.timer → academy-reap-labs.service oneshot). The "
-            "console sweep is why this timer must be ENABLED on every host that "
-            "spawns consoles, not only the one running the lab worker."
+            "Find active lab instances idle longer than LAB_IDLE_MINUTES and enqueue "
+            "worker-owned destroy intents. This command never imports or invokes the "
+            "containerlab engine and is safe on the web host."
         ),
     )
     rl.set_defaults(func=_reap_labs)
+
+    lr = sub.add_parser(
+        "lab-reconcile",
+        help="One-shot lab-host recovery: repair expired claims and runtime drift.",
+    )
+    lr.set_defaults(func=_lab_reconcile)
 
     ed = sub.add_parser(
         "email-digest",
         help="One-shot: email each cohort's instructor(s) a progress digest.",
         description=(
-            "Cross-tenant: open an app_admin (BYPASSRLS) session, build the "
+            "Cross-tenant: open an offline app_admin (BYPASSRLS) session, build the "
             "cohort progress matrix for every cohort in every tenant, and email "
             "each cohort's enrolled instructor(s) a summary. Email failures are "
             "non-fatal. Intended to run on a timer "
@@ -1197,7 +1241,7 @@ def main() -> None:
         "learner-digest",
         help="One-shot: email each learner their weekly progress summary.",
         description=(
-            "Cross-tenant: open an app_admin (BYPASSRLS) session and queue one "
+            "Cross-tenant: open an offline app_admin (BYPASSRLS) session and queue one "
             "weekly progress email per active student learner — what they did, "
             "where they are, what is next. Distinct from email-digest, which is "
             "the instructor cohort matrix. Idempotent per ISO week. Gated by the "
