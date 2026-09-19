@@ -304,7 +304,10 @@ def provision(db: Session, instance: LabInstance, engine: LabEngine, template: L
     process may still be running in the background — so the instance
     conservatively stays ``active`` instead, mirroring ``_run_deploy``'s
     destroy-failure handling in ``lab_operations.py``. Capacity accounting
-    (``_capacity_available``) excludes only ``error``, and over-counting a
+    (``_capacity_available``) is presence-based, not status-based: this
+    failure path sets ``instance.runtime_presence = "unknown"`` (set the
+    moment invocation is reached, see below), which keeps it capacity-counted
+    exactly like a genuinely active instance would be, and over-counting a
     phantom-but-live instance self-heals via ``reconcile_runtime`` once
     inventory proves absence, whereas under-counting would not self-correct
     as safely. ``instance.error`` is set to a non-``None`` message on every
@@ -318,9 +321,13 @@ def provision(db: Session, instance: LabInstance, engine: LabEngine, template: L
     except Exception as exc:  # nothing was ever attempted; no runtime to protect
         instance.status = "error"
         instance.error = str(exc)
+        instance.runtime_presence = "absent"
         db.flush()
         return instance
 
+    # Set immediately before invocation — an exception at or after this point
+    # does not prove the runtime is absent.
+    instance.runtime_presence = "unknown"
     try:
         handle = engine.deploy(topology_text, instance.instance_name)
         consoles: dict = {}
@@ -339,11 +346,13 @@ def provision(db: Session, instance: LabInstance, engine: LabEngine, template: L
         instance.started_at = now
         instance.last_active_at = now
         instance.error = None
+        instance.runtime_presence = "present"
     except HostLockUnavailable:
         raise
     except Exception as exc:  # deploy was invoked; failure doesn't prove absence
         instance.status = "active"
         instance.error = str(exc)
+        instance.runtime_presence = "unknown"
     db.flush()
     return instance
 
@@ -512,6 +521,10 @@ def reset(db: Session, instance: LabInstance, engine: LabEngine, template: LabTe
     try:
         stop_consoles(instance)
         topology_text = _set_topology_name(interpolate(template.topology, instance.seed), instance.instance_name)
+        # Set immediately before invocation — an interpolation/console
+        # failure above this line leaves the prior presence value untouched;
+        # a failure at or after this line has already crossed into "unknown".
+        instance.runtime_presence = "unknown"
         handle = engine.reset(topology_text, instance.instance_name)
         consoles: dict = {}
         for node in handle.nodes:
@@ -527,17 +540,33 @@ def reset(db: Session, instance: LabInstance, engine: LabEngine, template: LabTe
         instance.status = "active"
         instance.last_active_at = _now()
         instance.error = None
+        instance.runtime_presence = "present"
     except Exception as exc:  # surface any deploy failure onto the row
         instance.status = "error"
         instance.error = str(exc)
+        # No presence assignment here: if engine.reset() was never invoked,
+        # presence is untouched (still whatever it was before this call); if
+        # invocation began, it is already "unknown" from the pre-invocation
+        # assignment above.
     db.flush()
     return instance
 
 
 def destroy(db: Session, instance: LabInstance, engine: LabEngine) -> LabInstance:
-    """Destroy the underlying lab and mark the instance ``reaped``."""
+    """Destroy the underlying lab and mark the instance ``reaped``.
+
+    A failure here (``engine.destroy`` raising) cannot prove the runtime is
+    absent — but this function does not catch it: the outer ``run_claimed``
+    caller in ``app/services/lab_operations.py`` already owns settling
+    failures for this operation and reapplies ``unknown`` after its own
+    rollback, so there is nothing to handle here beyond conservatively
+    setting "unknown" before invocation.
+    """
+    # Set conservatively before invocation, mirroring provision()/reset().
+    instance.runtime_presence = "unknown"
     engine.destroy(instance.instance_name)
     stop_consoles(instance)
     instance.status = "reaped"
+    instance.runtime_presence = "absent"
     db.flush()
     return instance
