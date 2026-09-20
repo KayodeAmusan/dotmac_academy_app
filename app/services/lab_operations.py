@@ -96,22 +96,37 @@ def worker_identity() -> str:
 
 
 def _insert_open_operation_stmt(
-    *, instance: LabInstance, kind: str, requested_by: UUID | None
+    *,
+    instance: LabInstance,
+    kind: str,
+    requested_by: UUID | None,
+    origin: str | None,
+    runtime_precondition: str | None,
 ) -> Any:
     """Build one insert-or-skip statement for the open-per-instance constraint.
 
-    The explicit value list is security-sensitive: it is exactly the five
-    columns granted to ``app_user`` by migration 0055.
+    The explicit value list is security-sensitive: the five base columns are
+    exactly what migration 0055 grants ``app_user`` INSERT on. ``origin``/
+    ``runtime_precondition`` (migration 0060) are worker-owned and excluded
+    from that grant identically — they are only ever included in the values
+    dict (never left implicit) when a caller actually passes them, so an
+    ordinary web-tier enqueue (which never supplies them) sends exactly the
+    same five-column INSERT it always has.
     """
+    values: dict[str, object] = {
+        "id": uuid4(),
+        "tenant_id": instance.tenant_id,
+        "instance_id": instance.id,
+        "kind": kind,
+        "requested_by": requested_by,
+    }
+    if origin is not None:
+        values["origin"] = origin
+    if runtime_precondition is not None:
+        values["runtime_precondition"] = runtime_precondition
     return (
         insert(LabOperation)
-        .values(
-            id=uuid4(),
-            tenant_id=instance.tenant_id,
-            instance_id=instance.id,
-            kind=kind,
-            requested_by=requested_by,
-        )
+        .values(**values)
         .on_conflict_do_nothing(
             index_elements=[LabOperation.instance_id],
             index_where=LabOperation.state.in_(OPEN_STATES),
@@ -140,6 +155,8 @@ def enqueue(
     instance: LabInstance,
     kind: str,
     requested_by: UUID | None,
+    origin: str | None = None,
+    runtime_precondition: str | None = None,
 ) -> LabOperation:
     """Insert one open intent per instance, returning the existing one on races.
 
@@ -151,11 +168,24 @@ def enqueue(
     finds nothing (the new conflicting row also settled in that same narrow
     window), give up with a clean, callable-facing error rather than raising
     ``NoResultFound``.
+
+    ``origin``/``runtime_precondition`` (migration 0060) are optional and
+    included in the insert only when a caller actually passes them (see
+    ``_insert_open_operation_stmt``) — every ordinary caller
+    (``lab_lifecycle.request_lab``, ``request_idle_reaps``,
+    ``reconcile_stuck``, ``reclaim_previous_epoch``) leaves both ``None``,
+    naming only the five columns ``app_user`` may ever INSERT.
     """
     if kind not in KINDS:
         raise ValueError(f"unsupported lab operation kind {kind!r}")
     inserted_id = db.scalar(
-        _insert_open_operation_stmt(instance=instance, kind=kind, requested_by=requested_by)
+        _insert_open_operation_stmt(
+            instance=instance,
+            kind=kind,
+            requested_by=requested_by,
+            origin=origin,
+            runtime_precondition=runtime_precondition,
+        )
     )
     if inserted_id is not None:
         return db.scalars(select(LabOperation).where(LabOperation.id == inserted_id)).one()
@@ -165,7 +195,13 @@ def enqueue(
     # The conflicting row settled between our insert-conflict and the
     # re-select above. Retry the complete insert exactly once.
     retried_id = db.scalar(
-        _insert_open_operation_stmt(instance=instance, kind=kind, requested_by=requested_by)
+        _insert_open_operation_stmt(
+            instance=instance,
+            kind=kind,
+            requested_by=requested_by,
+            origin=origin,
+            runtime_precondition=runtime_precondition,
+        )
     )
     if retried_id is not None:
         return db.scalars(select(LabOperation).where(LabOperation.id == retried_id)).one()
@@ -370,7 +406,14 @@ def _automatic_destroy_escalation_message(
     gap between this fix landing and an earlier release of the worker leaves
     no unmarked wrong-host refusal able to count toward the threshold. Only
     failures after the instance's most recent *successful* ``deploy``
-    operation count, so a successful manual redeploy starts a fresh window.
+    operation count, so a successful manual redeploy starts a fresh window —
+    but a ``deploy`` settled ``state="succeeded"`` with a non-``NULL``
+    ``last_error`` is excluded from counting as that successful redeploy: the
+    round-6 status-escalation fix settles a fully-ambiguous conditional
+    deploy outcome as ``"succeeded"`` (the operation itself did not fail) while
+    still marking the instance ``status="error"`` and the operation's own
+    ``last_error``, so this is not a genuinely healthy redeploy and must not
+    silently reset this window.
     The scan is bounded at the threshold rather than unbounded history: no
     single row can carry more attempts than the ceiling itself, so the most
     recent ``threshold`` failed rows are always enough to reach it if it can
@@ -382,6 +425,7 @@ def _automatic_destroy_escalation_message(
         .where(LabOperation.instance_id == instance_id)
         .where(LabOperation.kind == "deploy")
         .where(LabOperation.state == "succeeded")
+        .where(LabOperation.last_error.is_(None))
     )
     prior_failure_query = (
         select(LabOperation.attempts)
@@ -424,6 +468,107 @@ def _automatic_destroy_escalation_message(
         return None
     return (
         f"automatic destroy failed {cumulative_attempts} times; "
+        "manual intervention required"
+    )
+
+
+def _automatic_repair_deploy_escalation_message(
+    db: Session,
+    *,
+    instance_id: UUID,
+    current_operation_id: UUID,
+    current_operation_attempts: int,
+) -> str | None:
+    """Return an escalation message once cumulative automatic repair-deploy
+    ATTEMPTS for ``instance_id`` reach the deploy attempt ceiling, else
+    ``None``.
+
+    Mirrors :func:`_automatic_destroy_escalation_message` exactly, for the
+    deploy side of the same problem: ``reconcile_runtime``'s
+    ``missing_runtime`` branch manufactures a fresh ``LabOperation`` row
+    (with a fresh attempt budget) every reconciler pass for as long as the
+    instance's status stays in ``("provisioning", "active", "resetting")``
+    and its runtime remains absent — nothing bounds this across passes,
+    only within one row's own ``attempts``. Before this design, the
+    reconciler itself capped this by escalating directly from its own
+    snapshot the first time it saw a prior ``instance.error``; that
+    projection was correctly removed (only the worker's own locked recheck
+    may decide an outcome), but nothing replaced the bound it also
+    provided. This closes that gap the same way the destroy side is
+    already closed, from the worker's own settle-time observation, not a
+    reconciler projection.
+
+    Sums ``attempts`` across ``failed``, ``kind="deploy"``,
+    ``origin="runtime_repair"``, ``requested_by IS NULL`` operations for
+    this instance, plus the current failure's own ``attempts``. Excludes
+    the same two operator-refusal/wrong-host cases
+    ``_automatic_destroy_escalation_message`` excludes, for full symmetry
+    with the destroy-side function: a ``WrongLabHostError`` from this exact
+    code path is already fully handled by ``run_claimed``'s own earlier
+    ``except WrongLabHostError`` clause (which restores state and refunds
+    the attempt) before this generic failure handler ever runs, so no row
+    settled through that clause can carry this branch's own state — but a
+    wrong-host refusal that instead lease-expires or restart-reclaims
+    before ever reaching that clause (and is later marked ``"failed"``
+    directly by ``reconcile_stuck``/reclaim's own ceiling check) could
+    otherwise still contribute here; a misconfigured host role is not a
+    genuine repair-deploy execution failure either way. Only failures after
+    the instance's most recent
+    GENUINELY successful deploy count (``state="succeeded"`` AND
+    ``last_error IS NULL`` — a "succeeded" settlement that only escalated
+    an ambiguous conditional outcome to manual verification, see this
+    file's round-9 fix to ``run_claimed``'s ``is_conditional_deploy``
+    branch, does not count as a healthy redeploy and must not reset this
+    window either).
+    """
+    threshold = MAX_ATTEMPTS_BY_KIND["deploy"]
+    last_deploy_success_at = db.scalar(
+        select(func.max(LabOperation.finished_at))
+        .where(LabOperation.instance_id == instance_id)
+        .where(LabOperation.kind == "deploy")
+        .where(LabOperation.state == "succeeded")
+        .where(LabOperation.last_error.is_(None))
+    )
+    prior_failure_query = (
+        select(LabOperation.attempts)
+        .where(LabOperation.instance_id == instance_id)
+        .where(LabOperation.kind == "deploy")
+        .where(LabOperation.origin == "runtime_repair")
+        .where(LabOperation.state == "failed")
+        .where(LabOperation.requested_by.is_(None))
+        .where(LabOperation.id != current_operation_id)
+        .where(
+            or_(
+                LabOperation.last_error.is_(None),
+                ~LabOperation.last_error.startswith(
+                    _OPERATOR_REFUSAL_LAST_ERROR_PREFIX
+                ),
+            )
+        )
+        .where(
+            or_(
+                LabOperation.last_error.is_(None),
+                ~LabOperation.last_error.contains(
+                    _WRONG_LAB_HOST_LAST_ERROR_SUBSTRING, autoescape=True
+                ),
+            )
+        )
+    )
+    if last_deploy_success_at is not None:
+        prior_failure_query = prior_failure_query.where(
+            LabOperation.finished_at > last_deploy_success_at
+        )
+    bounded = (
+        prior_failure_query.order_by(LabOperation.finished_at.desc())
+        .limit(threshold)
+        .subquery()
+    )
+    prior_attempts = int(db.scalar(select(func.sum(bounded.c.attempts))) or 0)
+    cumulative_attempts = min(prior_attempts + current_operation_attempts, threshold)
+    if cumulative_attempts < threshold:
+        return None
+    return (
+        f"automatic repair deploy failed {cumulative_attempts} times; "
         "manual intervention required"
     )
 
@@ -543,64 +688,199 @@ def run_claimed(
     operation_instance_id = op.instance_id
     operation_requested_by = op.requested_by
     operation_attempts = op.attempts
+    operation_origin = op.origin
+    operation_runtime_precondition = op.runtime_precondition
     initial_instance_status = instance.status
     initial_instance_error = instance.error
     initial_instance_presence = instance.runtime_presence
+    # Both must match (kind, origin, precondition) exactly — origin alone is
+    # audit/provenance and is never a decision input on its own; see migration
+    # 0060_lab_conditional_ops.py's module docstring for the full shape.
+    is_conditional_deploy = (
+        operation_kind == "deploy"
+        and operation_origin == "runtime_repair"
+        and operation_runtime_precondition == "absent"
+    )
+    is_conditional_destroy = (
+        operation_kind == "destroy"
+        and operation_origin == "runtime_cleanup"
+        and operation_runtime_precondition == "present"
+    )
+    settle_error: str | None = None
 
     try:
         if operation_kind == "deploy":
-            if not _capacity_available(db, instance):
+            if is_conditional_deploy:
+                # LOAD-BEARING ORDERING for the precondition-HOLDS (genuinely
+                # absent) path: locked precondition check -> conditional
+                # containerlab mutation (only if the precondition allows it) ->
+                # console teardown (only if a mutation actually occurred) ->
+                # console recreation / final projection. A precondition mismatch
+                # must settle BEFORE engine.deploy/any topology mutation ever
+                # runs — see migration 0060's module docstring. The mismatch
+                # (runtime observed present) path is different: it always
+                # tears down and resyncs consoles unconditionally — see
+                # lab_lifecycle._rebuild_consoles_from_live_inspection's own
+                # docstring for why.
+                _refresh_claim(db, operation_id=operation_id, claimed_by=claimed_by)
+                # Optimization only, NOT the correctness guarantee: an
+                # already-known-present runtime may settle immediately as a
+                # no-op without holding a capacity slot for an operation about
+                # to no-op anyway. The mandatory, authoritative recheck is
+                # inside lab_lifecycle.provision_if_absent()'s call to
+                # engine.deploy_if_absent() below — a race that flips this
+                # preliminary observation is still caught there.
+                try:
+                    preliminary_present = engine.status(instance.instance_name) == "running"
+                except HostLockUnavailable:
+                    raise
+                if preliminary_present:
+                    # This fully settles the outcome — deploy_if_absent() is
+                    # NEVER called on this path — but through the same
+                    # rigorous resync as any other confirmed-present outcome:
+                    # a fresh, authoritative inspection runs FIRST, and only
+                    # once it confirms a live handle are any stale consoles
+                    # (routinely present for this operation kind's own target
+                    # instance — see lab_lifecycle.resync_present_
+                    # preliminary's own docstring) stopped and rebuilt. Never
+                    # a bare trust-and-skip. No durable reservation is
+                    # committed before this call: unlike an ordinary
+                    # containerlab deploy, stop_consoles/start_console are
+                    # idempotent/self-healing by construction, so the narrow
+                    # claim-loss window this branch doesn't guard against
+                    # (see lab_lifecycle.resync_present_preliminary's
+                    # docstring) is an accepted residual property, not a gap.
+                    lab_lifecycle.resync_present_preliminary(db, instance, engine)
+                else:
+                    if not _capacity_available(db, instance):
+                        _requeue_for_capacity(db, op, instance)
+                        db.commit()
+                        return "deferred"
+                    instance.status = (
+                        "resetting"
+                        if instance.status in ("active", "resetting")
+                        else "provisioning"
+                    )
+                    instance.runtime_presence = "unknown"
+                    db.commit()
+                    refreshed_op = db.get(LabOperation, operation_id)
+                    refreshed_instance = (
+                        db.get(LabInstance, refreshed_op.instance_id)
+                        if refreshed_op is not None
+                        else None
+                    )
+                    if (
+                        refreshed_op is None
+                        or refreshed_instance is None
+                        or refreshed_op.state != "claimed"
+                        or refreshed_op.claimed_by != claimed_by
+                    ):
+                        db.rollback()
+                        return "stale"
+                    op = refreshed_op
+                    instance = refreshed_instance
+                    template = db.scalars(
+                        select(LabTemplate)
+                        .where(LabTemplate.tenant_id == instance.tenant_id)
+                        .where(LabTemplate.activity_id == instance.activity_id)
+                    ).one()
+                    _refresh_claim(db, operation_id=operation_id, claimed_by=claimed_by)
+                    lab_lifecycle.provision_if_absent(
+                        db,
+                        instance,
+                        engine,
+                        template,
+                        preserved_status=initial_instance_status,
+                        preserved_error=initial_instance_error,
+                    )
+                if instance.runtime_presence != "present":
+                    # Neither resync_present_preliminary nor
+                    # provision_if_absent's own ambiguous-outcome branches
+                    # ever confirmed the runtime is genuinely present here
+                    # — this settles "succeeded" at the shared tail below
+                    # like any other non-exceptional outcome (an idempotent
+                    # no-op is not a failure), but it must not be mistaken
+                    # for a genuinely healthy redeploy by either escalation
+                    # function's own window-reset query: mark the
+                    # OPERATION's own last_error too, the only signal those
+                    # queries have to distinguish "actually confirmed
+                    # healthy" from "settled without ever confirming
+                    # anything." This covers BOTH the escalated (status
+                    # forced to "error") and non-escalated (status
+                    # reverted/restored to its own prior value, e.g.
+                    # "active") ambiguous sub-cases — checking `status ==
+                    # "error"` alone missed the non-escalated sub-case
+                    # entirely, since an "active" prior status is
+                    # deliberately never escalated (it has its own safe
+                    # self-healing path via reconcile_runtime's next pass)
+                    # but is JUST AS UNCONFIRMED as the escalated case for
+                    # the purpose of resetting either escalation window.
+                    settle_error = (
+                        f"{instance.error}; conditional deploy could not "
+                        "confirm runtime presence"
+                        if instance.error
+                        else "conditional deploy could not confirm runtime presence"
+                    )
+            elif not _capacity_available(db, instance):
                 _requeue_for_capacity(db, op, instance)
                 db.commit()
                 return "deferred"
-            # Make the reservation visible and release the advisory transaction
-            # lock before slow external work. A crash now leaves a counted
-            # transient state that reconcile_stuck() can repair and replay.
-            instance.status = (
-                "resetting" if instance.status in ("active", "resetting") else "provisioning"
-            )
-            # First/authoritative presence assignment for this deploy: this is
-            # the durable reservation, committed before slow external work, so
-            # a crash after this point must already treat the runtime as
-            # uncertain rather than proven absent.
-            instance.runtime_presence = "unknown"
-            db.commit()
-            refreshed_op = db.get(LabOperation, operation_id)
-            refreshed_instance = (
-                db.get(LabInstance, refreshed_op.instance_id)
-                if refreshed_op is not None
-                else None
-            )
-            if (
-                refreshed_op is None
-                or refreshed_instance is None
-                or refreshed_op.state != "claimed"
-                or refreshed_op.claimed_by != claimed_by
-            ):
-                db.rollback()
-                return "stale"
-            op = refreshed_op
-            instance = refreshed_instance
-            template = db.scalars(
-                select(LabTemplate)
-                .where(LabTemplate.tenant_id == instance.tenant_id)
-                .where(LabTemplate.activity_id == instance.activity_id)
-            ).one()
-            _refresh_claim(db, operation_id=operation_id, claimed_by=claimed_by)
-            _run_deploy(
-                db,
-                instance,
-                template,
-                engine,
-                after_destroy=lambda: _refresh_claim(
+            else:
+                # Make the reservation visible and release the advisory
+                # transaction lock before slow external work. A crash now
+                # leaves a counted transient state that reconcile_stuck() can
+                # repair and replay.
+                instance.status = (
+                    "resetting" if instance.status in ("active", "resetting") else "provisioning"
+                )
+                # First/authoritative presence assignment for this deploy: this
+                # is the durable reservation, committed before slow external
+                # work, so a crash after this point must already treat the
+                # runtime as uncertain rather than proven absent.
+                instance.runtime_presence = "unknown"
+                db.commit()
+                refreshed_op = db.get(LabOperation, operation_id)
+                refreshed_instance = (
+                    db.get(LabInstance, refreshed_op.instance_id)
+                    if refreshed_op is not None
+                    else None
+                )
+                if (
+                    refreshed_op is None
+                    or refreshed_instance is None
+                    or refreshed_op.state != "claimed"
+                    or refreshed_op.claimed_by != claimed_by
+                ):
+                    db.rollback()
+                    return "stale"
+                op = refreshed_op
+                instance = refreshed_instance
+                template = db.scalars(
+                    select(LabTemplate)
+                    .where(LabTemplate.tenant_id == instance.tenant_id)
+                    .where(LabTemplate.activity_id == instance.activity_id)
+                ).one()
+                _refresh_claim(db, operation_id=operation_id, claimed_by=claimed_by)
+                _run_deploy(
                     db,
-                    operation_id=operation_id,
-                    claimed_by=claimed_by,
-                ),
-            )
+                    instance,
+                    template,
+                    engine,
+                    after_destroy=lambda: _refresh_claim(
+                        db,
+                        operation_id=operation_id,
+                        claimed_by=claimed_by,
+                    ),
+                )
         elif operation_kind == "destroy":
             _refresh_claim(db, operation_id=operation_id, claimed_by=claimed_by)
-            lab_lifecycle.destroy(db, instance, engine)
+            if is_conditional_destroy:
+                # Same load-bearing ordering as the conditional-deploy branch
+                # above, mirrored for destroy: precondition check -> mutation
+                # (only if present) -> console teardown (only if destroyed).
+                lab_lifecycle.destroy_if_present(db, instance, engine)
+            else:
+                lab_lifecycle.destroy(db, instance, engine)
         elif operation_kind == "check":
             template = db.scalars(
                 select(LabTemplate)
@@ -662,25 +942,60 @@ def run_claimed(
         ):
             db.rollback()
             return "stale"
-        if operation_kind != "deploy":
+        if is_conditional_deploy or is_conditional_destroy:
+            # deploy_if_absent()/destroy_if_present() acquire host_lock
+            # exactly ONCE for the whole observe-then-mutate operation — if
+            # that single acquisition itself raises HostLockUnavailable,
+            # NOTHING has been mutated yet (not even the precondition check
+            # ran), unlike the ordinary destroy-then-deploy path below, which
+            # cannot make that guarantee since it is two separate engine
+            # calls. It is therefore safe — and more accurate, not merely
+            # conservative — to restore the instance's exact pre-operation
+            # state here, even for a conditional "deploy" whose capacity
+            # reservation may have already committed a "resetting"/
+            # "provisioning"/"unknown" placeholder in an earlier transaction.
+            #
+            # This restoration is equally safe on the OTHER conditional-
+            # deploy path that can raise HostLockUnavailable here — the
+            # preliminary-present branch's call into
+            # lab_lifecycle.resync_present_preliminary() /
+            # _rebuild_consoles_from_live_inspection(), which itself calls
+            # engine.inspect_running() (also a single, atomic host_lock
+            # acquisition). This is only true because
+            # _rebuild_consoles_from_live_inspection() now calls
+            # inspect_running() BEFORE stop_consoles() — previously it called
+            # stop_consoles() first, so a HostLockUnavailable raised from
+            # inspect_running()'s own lock acquisition could follow a
+            # real, already-executed console teardown, making a blanket
+            # "NOTHING has been mutated yet" claim overclaim in that case.
+            # With that ordering fixed, no console has been touched either
+            # by the time any HostLockUnavailable reaches this handler, so
+            # restoring instance state verbatim is correct for both
+            # call sites this branch covers.
+            unchanged_instance.status = initial_instance_status
+            unchanged_instance.error = initial_instance_error
+            unchanged_instance.runtime_presence = initial_instance_presence
+        elif operation_kind != "deploy":
             # Nothing destructive has necessarily happened yet for
             # destroy/check before this handler fires — safe to restore the
             # pre-execution instance state verbatim.
             unchanged_instance.status = initial_instance_status
             unchanged_instance.error = initial_instance_error
             unchanged_instance.runtime_presence = initial_instance_presence
-        # For "deploy", _run_deploy already set instance.status to
-        # "resetting"/"provisioning" for the whole destroy-then-provision
-        # sequence before attempting the (possibly already-succeeded) destroy.
-        # That value stays correctly capacity-counted (_capacity_available
-        # treats provisioning/active/resetting alike) and, unlike the
-        # pre-reset "active", does not falsely claim a working lab when the
-        # real runtime may have just been torn down and not yet redeployed.
-        # Leave it untouched. Presence is likewise left as "unknown" (already
-        # set by _run_deploy/run_claimed's reservation) rather than restored:
-        # a deploy may have already destroyed the old runtime before
-        # contention hit during the subsequent provision call, so blindly
-        # restoring the pre-op presence would be a false projection.
+        # For an ordinary (non-conditional) "deploy", _run_deploy already set
+        # instance.status to "resetting"/"provisioning" for the whole
+        # destroy-then-provision sequence before attempting the (possibly
+        # already-succeeded) destroy. That value stays correctly
+        # capacity-counted (_capacity_available treats provisioning/active/
+        # resetting alike) and, unlike the pre-reset "active", does not
+        # falsely claim a working lab when the real runtime may have just
+        # been torn down and not yet redeployed. Leave it untouched. Presence
+        # is likewise left as "unknown" (already set by _run_deploy/
+        # run_claimed's reservation) rather than restored: an ordinary deploy
+        # may have already destroyed the old runtime before contention hit
+        # during the subsequent provision call, so blindly restoring the
+        # pre-op presence would be a false projection. This is exactly the
+        # ambiguity the conditional path above does NOT have.
         _requeue_operation_after_host_lock(db, refreshed_op)
         db.commit()
         return "deferred"
@@ -720,6 +1035,23 @@ def run_claimed(
                 failed_instance.runtime_presence = (
                     "absent" if observed_presence == "absent" else "unknown"
                 )
+                if operation_origin == "runtime_repair" and operation_requested_by is None:
+                    # Automatic (reconciler-triggered) repair deploys retry
+                    # forever otherwise — see this function's own escalation
+                    # helper docstring for the full mechanism. Mirrors the
+                    # destroy branch's own escalation exactly.
+                    escalation_message = _automatic_repair_deploy_escalation_message(
+                        db,
+                        instance_id=operation_instance_id,
+                        current_operation_id=operation_id,
+                        current_operation_attempts=operation_attempts,
+                    )
+                    if escalation_message is not None:
+                        failed_instance.status = "error"
+                        failed_instance.error = escalation_message
+                        # Never force "absent" here — escalation must not
+                        # falsely claim the runtime is gone; presence stays
+                        # whatever was just set above.
         elif operation_kind == "destroy":
             # A failed destroy (manual or automatic) cannot prove the runtime
             # is absent either — set this unconditionally, before the
@@ -764,6 +1096,7 @@ def run_claimed(
         operation_id=operation_id,
         claimed_by=claimed_by,
         state="succeeded",
+        error=settle_error,
     ):
         db.rollback()
         return "stale"
@@ -784,14 +1117,15 @@ def _fail_operation_at_ceiling(
 
     Shared by ``reconcile_stuck``'s ordinary lease-expiry path and
     ``reclaim_previous_epoch``'s restart-reclaim path so the ceiling check and
-    its instance projection — including automatic-destroy escalation — cannot
-    drift apart between the two recovery paths: a worker process that
-    repeatedly crashes before settling an operation must eventually stop
-    retrying exactly like a repeatedly-hanging one does. Each caller supplies
-    its own ``last_error`` message text; the projection/escalation logic
-    itself is identical for both callers. Deliberately does NOT call
-    ``_clear_claim_fields`` — like every other terminal settlement, the claim
-    fields stay behind as audit provenance.
+    its instance projection — including automatic-destroy escalation and
+    automatic repair-deploy escalation — cannot drift apart between the two
+    recovery paths: a worker process that repeatedly crashes before settling
+    an operation must eventually stop retrying exactly like a
+    repeatedly-hanging one does. Each caller supplies its own ``last_error``
+    message text; the projection/escalation logic itself is identical for
+    both callers. Deliberately does NOT call ``_clear_claim_fields`` — like
+    every other terminal settlement, the claim fields stay behind as audit
+    provenance.
     """
     op.state = "failed"
     op.finished_at = now
@@ -808,6 +1142,31 @@ def _fail_operation_at_ceiling(
         # repeatedly-crashing engine lets the idle reaper re-enqueue destroys
         # for this instance forever.
         escalation_message = _automatic_destroy_escalation_message(
+            db,
+            instance_id=op.instance_id,
+            current_operation_id=op.id,
+            current_operation_attempts=op.attempts,
+        )
+        if escalation_message is not None:
+            instance.status = "error"
+            instance.error = escalation_message
+            # Presence stays "unknown" (set above) — never forced to
+            # "absent" by escalation.
+    if (
+        instance is not None
+        and op.kind == "deploy"
+        and op.origin == "runtime_repair"
+        and op.requested_by is None
+    ):
+        # Same reasoning as the destroy branch above, for automatic
+        # repair-deploy retries: a stuck/lease-expired/crash-reclaimed
+        # conditional deploy is the same persistent-failure signal as a
+        # synchronous one (see run_claimed's own escalation wiring, round
+        # 7) and must count toward the same cumulative threshold, or a
+        # hanging or repeatedly-crashing engine lets reconcile_runtime's
+        # missing_runtime branch re-enqueue repair deploys for this
+        # instance forever.
+        escalation_message = _automatic_repair_deploy_escalation_message(
             db,
             instance_id=op.instance_id,
             current_operation_id=op.id,

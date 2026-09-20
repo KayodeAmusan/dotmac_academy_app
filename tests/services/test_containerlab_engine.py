@@ -4,6 +4,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -96,7 +97,8 @@ def test_ssh_exec_uses_mgmt_ip():
 
 
 @pytest.mark.parametrize(
-    "method", ["inventory", "deploy", "ssh_exec", "destroy", "reset", "exec", "status"]
+    "method", ["inventory", "deploy", "ssh_exec", "destroy", "reset", "exec", "status",
+               "inspect_running"]
 )
 def test_operations_refuse_on_web_host_without_side_effects(tmp_path, method):
     eng = ContainerlabEngine(workdir=str(tmp_path), lab_host_role="web")
@@ -111,6 +113,7 @@ def test_operations_refuse_on_web_host_without_side_effects(tmp_path, method):
                 "reset": lambda: eng.reset("name: x", "i"),
                 "exec": lambda: eng.exec(handle, "r1", ["true"]),
                 "status": lambda: eng.status("i"),
+                "inspect_running": lambda: eng.inspect_running("i"),
             }[method]()
         popen.assert_not_called()
     assert not (tmp_path / "i").exists()
@@ -192,6 +195,190 @@ def test_destroy_uses_the_inspected_path_when_it_matches_the_expected_topology(t
     assert not (tmp_path / "missing").exists()
 
 
+def _counting_host_lock(monkeypatch):
+    """Wrap the real ``host_lock`` context manager with a call counter,
+    delegating to the genuine implementation (a real, tmp_path-scoped flock)
+    so the underlying mutual-exclusion behavior is unaffected — only the
+    number of times a caller *enters* the context manager is observed.
+    """
+    calls: list[None] = []
+    real_host_lock = containerlab.host_lock
+
+    @contextmanager
+    def _wrapped(label, *, directory=None):
+        calls.append(None)
+        with real_host_lock(label, directory=directory):
+            yield
+
+    monkeypatch.setattr(containerlab, "host_lock", _wrapped)
+    return calls
+
+
+def test_deploy_if_absent_acquires_host_lock_exactly_once_when_deploying(tmp_path, monkeypatch):
+    """Observation + mutation happen inside exactly ONE host_lock acquisition
+    — not two separate ones the way composing the public inventory()+deploy()
+    would (each of those independently acquires and releases its own lock)."""
+    calls = _counting_host_lock(monkeypatch)
+    eng = ContainerlabEngine(workdir=str(tmp_path), lab_host_role="lab")
+    with patch("subprocess.Popen") as popen:
+        popen.side_effect = [
+            _fake_popen(stdout="{}"),  # inspect --all: nothing running (absent)
+            _fake_popen(
+                stdout='[{"name":"clab-i-r1","ipv4_address":"172.20.20.3/24","kind":"linux"}]',
+            ),  # the actual deploy
+        ]
+        handle = eng.deploy_if_absent("name: x", "i")
+    assert handle is not None
+    assert handle.nodes["r1"].endswith("-r1")
+    assert popen.call_count == 2  # inspect, then deploy — both inside the one lock
+    assert len(calls) == 1
+
+
+def test_deploy_if_absent_acquires_host_lock_exactly_once_and_noops_when_present(
+    tmp_path, monkeypatch
+):
+    calls = _counting_host_lock(monkeypatch)
+    eng = ContainerlabEngine(workdir=str(tmp_path), lab_host_role="lab")
+    with patch("subprocess.Popen") as popen:
+        popen.return_value = _fake_popen(
+            stdout=f'[{{"lab_name":"i","absLabPath":"{eng._topo_path("i")}"}}]',
+        )
+        handle = eng.deploy_if_absent("name: x", "i")
+    assert handle is None  # precondition mismatch: genuinely present already
+    popen.assert_called_once()  # only the inspect — no deploy call at all
+    assert len(calls) == 1
+    assert not (tmp_path / "i").exists()  # no topology file written on the no-op path
+
+
+def test_destroy_if_present_acquires_host_lock_exactly_once_when_destroying(
+    tmp_path, monkeypatch
+):
+    calls = _counting_host_lock(monkeypatch)
+    eng = ContainerlabEngine(workdir=str(tmp_path), lab_host_role="lab")
+    topo = tmp_path / "i" / "topo.clab.yml"
+    topo.parent.mkdir()
+    topo.write_text("name: i")
+    with patch("subprocess.Popen") as popen:
+        popen.side_effect = [
+            _fake_popen(
+                stdout=f'[{{"lab_name":"i","absLabPath":"{eng._topo_path("i")}"}}]',
+            ),  # inspect --all: present
+            _fake_popen(stdout=""),  # the actual destroy
+        ]
+        destroyed = eng.destroy_if_present("i")
+    assert destroyed is True
+    assert popen.call_count == 2  # inspect, then destroy — both inside the one lock
+    assert len(calls) == 1
+
+
+def test_destroy_if_present_acquires_host_lock_exactly_once_and_noops_when_absent(
+    tmp_path, monkeypatch
+):
+    calls = _counting_host_lock(monkeypatch)
+    eng = ContainerlabEngine(workdir=str(tmp_path), lab_host_role="lab")
+    with patch("subprocess.Popen") as popen:
+        popen.return_value = _fake_popen(stdout="{}")
+        destroyed = eng.destroy_if_present("i")
+    assert destroyed is False  # precondition mismatch: already absent
+    popen.assert_called_once()  # only the inspect — no destroy call at all
+    assert len(calls) == 1
+
+
+def test_inspect_running_reconstructs_a_handle_for_an_already_running_instance(tmp_path):
+    eng = ContainerlabEngine(workdir=str(tmp_path), lab_host_role="lab")
+    expected_path = eng._topo_path("i")
+    with patch("subprocess.Popen") as popen:
+        popen.return_value = _fake_popen(
+            stdout=(
+                f'[{{"lab_name":"i","name":"clab-i-r1","absLabPath":"{expected_path}",'
+                '"ipv4_address":"172.20.20.5/24","kind":"linux"}]'
+            ),
+        )
+        handle = eng.inspect_running("i")
+    assert handle is not None
+    assert handle.nodes["r1"] == "clab-i-r1"
+    assert handle.mgmt["r1"] == "172.20.20.5"
+    assert handle.kinds["r1"] == "linux"
+    popen.assert_called_once()  # only the inspect — never a redeploy
+
+
+def test_inspect_running_returns_none_when_not_actually_running(tmp_path):
+    eng = ContainerlabEngine(workdir=str(tmp_path), lab_host_role="lab")
+    with patch("subprocess.Popen") as popen:
+        popen.return_value = _fake_popen(stdout="{}")
+        handle = eng.inspect_running("i")
+    assert handle is None
+
+
+def test_inspect_running_refuses_a_lab_name_match_at_the_wrong_topology_path(tmp_path):
+    """Mirrors ``_destroy_unlocked``'s own ownership-verification test
+    (``test_destroy_refuses_when_the_inspected_path_does_not_match_the_expected_topology``):
+    an exact-name collision from outside Academy's own workdir must not
+    contribute untrusted node/mgmt data to a resync — this is a read-only
+    helper, so it returns ``None`` (behaves as "not found") rather than
+    raising, unlike the destructive ``_destroy_unlocked`` path.
+    """
+    eng = ContainerlabEngine(workdir=str(tmp_path), lab_host_role="lab")
+    with patch("subprocess.Popen") as popen:
+        popen.return_value = _fake_popen(
+            stdout=(
+                '[{"lab_name":"i","name":"clab-i-r1",'
+                '"absLabPath":"/some/other/operators/i.clab.yml",'
+                '"ipv4_address":"172.20.20.5/24","kind":"linux"}]'
+            ),
+        )
+        handle = eng.inspect_running("i")
+    assert handle is None
+
+
+def test_inspect_running_never_merges_nodes_across_a_same_named_path_collision(tmp_path):
+    """A same-``lab_name`` collision reported at an unowned path must never
+    contribute even ONE node to the accepted result, regardless of which
+    record ``containerlab inspect --all`` happened to report last.
+
+    Regression test for a bug where per-node data was accumulated into flat
+    ``nodes``/``mgmt``/``kinds`` dicts for EVERY record matching ``lab_name``,
+    while only a single, separately-tracked ``discovered_path`` variable was
+    checked against the expected path at the end — so an untrusted record's
+    node could survive in the accepted result even though the final path
+    check "passed" because a later, legitimately-pathed record was also
+    present. The fix groups discovered node data by the path it was reported
+    under and only ever reads from the one group whose path matches exactly.
+    """
+    eng = ContainerlabEngine(workdir=str(tmp_path), lab_host_role="lab")
+    expected_path = eng._topo_path("i")
+    good_record = (
+        '{"lab_name":"i","name":"clab-i-r1","absLabPath":"' + expected_path + '",'
+        '"ipv4_address":"172.20.20.5/24","kind":"linux"}'
+    )
+    bad_record = (
+        '{"lab_name":"i","name":"clab-i-r2",'
+        '"absLabPath":"/some/other/operators/i.clab.yml",'
+        '"ipv4_address":"172.20.20.9/24","kind":"linux"}'
+    )
+
+    with patch("subprocess.Popen") as popen:
+        popen.return_value = _fake_popen(stdout=f"[{good_record},{bad_record}]")
+        handle = eng.inspect_running("i")
+    assert handle is not None
+    assert handle.nodes == {"r1": "clab-i-r1"}
+    assert "r2" not in handle.nodes
+    assert "r2" not in handle.mgmt
+    assert "r2" not in handle.kinds
+
+    # Reversed order — the original bug's exact manifestation depended on
+    # which record was walked LAST, since only a single mutable
+    # ``discovered_path`` variable was checked at the end.
+    with patch("subprocess.Popen") as popen:
+        popen.return_value = _fake_popen(stdout=f"[{bad_record},{good_record}]")
+        handle = eng.inspect_running("i")
+    assert handle is not None
+    assert handle.nodes == {"r1": "clab-i-r1"}
+    assert "r2" not in handle.nodes
+    assert "r2" not in handle.mgmt
+    assert "r2" not in handle.kinds
+
+
 def test_inventory_maps_lab_names_to_inspected_topology_paths(tmp_path):
     eng = ContainerlabEngine(workdir=str(tmp_path), lab_host_role="lab")
     one_path = str(tmp_path / "dal-one" / "topo.clab.yml")
@@ -226,6 +413,72 @@ def test_inventory_excludes_a_lab_whose_path_is_outside_this_engines_workdir(tmp
             ),
         )
         assert eng.inventory() == {}
+
+
+def test_inventory_includes_the_owned_path_despite_a_same_named_collision_at_an_unowned_path(
+    tmp_path,
+):
+    """Regression test for the Finding-3 last-write-wins bug: ``inventory()``
+    grouped discovered paths by a single mutable "last path" variable, so an
+    unowned same-named record walked AFTER the legitimately-owned one would
+    silently overwrite it, excluding a genuinely deployed, owned lab from the
+    result entirely. The fix groups ALL distinct paths per ``lab_name`` into
+    a set and checks membership, so walk order can no longer matter.
+    """
+    eng = ContainerlabEngine(workdir=str(tmp_path), lab_host_role="lab")
+    owned_path = eng._topo_path("i")
+    owned_record = f'{{"lab_name":"i","absLabPath":"{owned_path}"}}'
+    unowned_record = '{"lab_name":"i","absLabPath":"/some/other/operators/i.clab.yml"}'
+
+    with patch("subprocess.Popen") as popen:
+        popen.return_value = _fake_popen(stdout=f"[{owned_record},{unowned_record}]")
+        assert eng.inventory() == {"i": owned_path}
+
+    # Reversed order — the original bug's exact manifestation depended on
+    # which record was walked LAST.
+    with patch("subprocess.Popen") as popen:
+        popen.return_value = _fake_popen(stdout=f"[{unowned_record},{owned_record}]")
+        assert eng.inventory() == {"i": owned_path}
+
+
+def test_destroy_uses_the_owned_path_despite_a_same_named_collision_at_an_unowned_path(
+    tmp_path,
+):
+    """Mirrors the inventory regression test above for ``destroy()``: a
+    same-named unowned collision walked LAST must not make destroy wrongly
+    refuse a genuinely owned, destroyable lab.
+    """
+    eng = ContainerlabEngine(workdir=str(tmp_path), lab_host_role="lab")
+    owned_path = eng._topo_path("i")
+    # No topology file on disk (mirrors ``test_destroy_uses_the_inspected_
+    # path_when_it_matches_the_expected_topology``'s own setup): this forces
+    # ``_destroy_unlocked`` down the "confirm via inspection" branch rather
+    # than trusting a locally-present file.
+    owned_record = f'{{"lab_name":"i","absLabPath":"{owned_path}"}}'
+    unowned_record = '{"lab_name":"i","absLabPath":"/some/other/operators/i.clab.yml"}'
+
+    with patch("subprocess.Popen") as popen:
+        popen.side_effect = [
+            _fake_popen(stdout=f"[{owned_record},{unowned_record}]"),
+            _fake_popen(stdout=""),
+        ]
+        eng.destroy("i")
+    assert popen.call_count == 2
+    assert popen.call_args_list[1].args[0] == [
+        "sudo", "-n", "containerlab", "destroy", "-t", owned_path, "--cleanup",
+    ]
+
+    # Reversed order.
+    with patch("subprocess.Popen") as popen:
+        popen.side_effect = [
+            _fake_popen(stdout=f"[{unowned_record},{owned_record}]"),
+            _fake_popen(stdout=""),
+        ]
+        eng.destroy("i")
+    assert popen.call_count == 2
+    assert popen.call_args_list[1].args[0] == [
+        "sudo", "-n", "containerlab", "destroy", "-t", owned_path, "--cleanup",
+    ]
 
 
 def test_destroy_does_not_hide_an_inspection_failure(tmp_path):

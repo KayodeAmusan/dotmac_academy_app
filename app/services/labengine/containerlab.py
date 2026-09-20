@@ -395,13 +395,18 @@ class ContainerlabEngine(LabEngine):
         except json.JSONDecodeError as exc:
             raise RuntimeError("inspect returned invalid JSON") from exc
 
-    def _inspect_lab_paths_unlocked(self) -> dict[str, str]:
-        """Every containerlab-reported lab name -> its real topology path.
+    def _inspect_lab_paths_unlocked(self) -> dict[str, set[str]]:
+        """Every containerlab-reported lab name -> the set of ALL distinct
+        real topology paths reported for it (never just the last one seen —
+        see the module's Finding-3-fix note in ``_inventory_unlocked``/
+        ``_destroy_unlocked`` for why a single mutable "last path" variable
+        let an unowned same-named collision silently defeat an ownership
+        check that only compared the final value).
 
         Unfiltered by design: a caller that already knows (by row identity)
         which specific instance it means to act on — e.g. ``_destroy_unlocked``
         below, recovering the real path for a lab whose expected topology
-        file went missing — needs whatever path containerlab actually
+        file went missing — needs whatever path(s) containerlab actually
         reports, not an ownership judgement about it. :meth:`inventory` is
         the ownership-filtered view built on top of this for callers (like
         ``reconcile_runtime``) that must decide *which* names are Academy's
@@ -416,18 +421,18 @@ class ContainerlabEngine(LabEngine):
         """
         self._require_lab_host()
         raw = self._inspect_all()
-        found: dict[str, str] = {}
+        found: dict[str, set[str]] = {}
 
         def _walk(value: object, hinted_name: str | None = None) -> None:
             if isinstance(value, dict):
                 lab_name = value.get("lab_name")
                 if not isinstance(lab_name, str) or not lab_name:
                     lab_name = hinted_name
-                path = value.get("absLabPath") or value.get("labPath")
                 if isinstance(lab_name, str) and lab_name:
-                    found.setdefault(lab_name, path if isinstance(path, str) else "")
+                    group = found.setdefault(lab_name, set())
+                    path = value.get("absLabPath") or value.get("labPath")
                     if isinstance(path, str) and path:
-                        found[lab_name] = path
+                        group.add(path)
                 for key, child in value.items():
                     child_hint = key if isinstance(child, list) else lab_name
                     _walk(child, child_hint)
@@ -451,12 +456,21 @@ class ContainerlabEngine(LabEngine):
         carry partial path info for labs this engine has no reason to trust
         anyway. This is the entrypoint used to decide *which* runtime names
         are eligible for orphan cleanup (``reconcile_runtime``); it is
-        deliberately narrower than :meth:`_inspect_lab_paths_unlocked`.
+        deliberately narrower than :meth:`_inspect_lab_paths_unlocked`. A name
+        is retained only if this engine's own expected path is ONE OF the
+        paths reported for it — never based on comparing against a single
+        arbitrary "last seen" path, which a same-named unowned collision
+        could otherwise control by sheer walk order.
 
         Unlocked — see :meth:`_inspect_lab_paths_unlocked`.
         """
         found = self._inspect_lab_paths_unlocked()
-        return {name: path for name, path in found.items() if path == self._topo_path(name)}
+        result: dict[str, str] = {}
+        for name, paths in found.items():
+            expected = self._topo_path(name)
+            if expected in paths:
+                result[name] = expected
+        return result
 
     def inventory(self) -> dict[str, str]:
         self._require_lab_host()
@@ -570,13 +584,13 @@ class ContainerlabEngine(LabEngine):
             # discovered path must match the one this engine would itself
             # have written before it's trusted — anything else is refused
             # rather than silently destroyed at an unverified location.
-            discovered_path = self._inspect_lab_paths_unlocked().get(instance_name)
-            if discovered_path is None:
+            discovered_paths = self._inspect_lab_paths_unlocked().get(instance_name)
+            if discovered_paths is None:
                 return
-            if discovered_path != path:
+            if path not in discovered_paths:
                 raise RuntimeError(
-                    f"destroy refused: deployed lab {instance_name!r} was inspected at "
-                    f"{discovered_path!r}, not the expected {path!r}"
+                    f"destroy refused: deployed lab {instance_name!r} was inspected "
+                    f"at {sorted(discovered_paths)!r}, not the expected {path!r}"
                 )
         r = _run_contained(
             [*_CLAB, "destroy", "-t", path, "--cleanup"],
@@ -589,6 +603,38 @@ class ContainerlabEngine(LabEngine):
         self._require_lab_host()
         with host_lock(self.lock_label, directory=self.workdir):
             self._destroy_unlocked(instance_name)
+
+    def deploy_if_absent(self, topology_text: str, instance_name: str) -> LabHandle | None:
+        """Observe-then-deploy inside exactly one ``host_lock`` acquisition.
+
+        Deliberately does NOT compose the public :meth:`inventory`/
+        :meth:`deploy` — each already acquires and releases its own
+        ``host_lock`` independently, which would reopen a window between
+        the observation and the mutation for another process to deploy the
+        same instance in between. Instead this calls the already-existing
+        unlocked helpers (``_lab_is_deployed_unlocked``/``_deploy_unlocked``)
+        directly, within a single ``with host_lock(...):`` block: observe
+        first, and only if genuinely absent, mutate — all before the lock is
+        released. No mutation helper is called at all if the instance is
+        already present.
+        """
+        self._require_lab_host()
+        with host_lock(self.lock_label, directory=self.workdir):
+            if self._lab_is_deployed_unlocked(instance_name):
+                return None
+            return self._deploy_unlocked(topology_text, instance_name)
+
+    def destroy_if_present(self, instance_name: str) -> bool:
+        """Observe-then-destroy inside exactly one ``host_lock`` acquisition.
+
+        Same single-acquisition reasoning as :meth:`deploy_if_absent`.
+        """
+        self._require_lab_host()
+        with host_lock(self.lock_label, directory=self.workdir):
+            if not self._lab_is_deployed_unlocked(instance_name):
+                return False
+            self._destroy_unlocked(instance_name)
+            return True
 
     def reset(self, topology_text: str, instance_name: str) -> LabHandle:
         self._require_lab_host()
@@ -618,6 +664,101 @@ class ContainerlabEngine(LabEngine):
         self._require_lab_host()
         with host_lock(self.lock_label, directory=self.workdir):
             return "running" if self._lab_is_deployed_unlocked(instance_name) else "absent"
+
+    def _inspect_running_handle_unlocked(self, instance_name: str) -> LabHandle | None:
+        """Reconstruct a live :class:`LabHandle` for ``instance_name`` from
+        ``containerlab inspect --all``'s own per-node fields, never a
+        redeploy. Returns ``None`` if not currently running.
+
+        Mirrors :meth:`_destroy_unlocked`'s own ownership-verification
+        pattern exactly: a ``lab_name`` match alone is not proof of
+        ownership — an exact-name collision from OUTSIDE Academy's own
+        workdir is still (however unlikely, given the name embeds tenant/
+        person/activity UUID fragments) not ruled out by name alone, so the
+        discovered path must match ``self._topo_path(instance_name)`` (the
+        path this engine would itself have written) before any of its node
+        data is trusted. Unlike ``_destroy_unlocked`` (which raises on a
+        mismatch, since destroying at an unverified location would be
+        actively destructive), a mismatch or missing path here just returns
+        ``None`` — this is a read-only resync helper, so "we couldn't safely
+        confirm ownership" is treated exactly like "not found/not running":
+        the caller (``_rebuild_consoles_from_live_inspection``) already
+        handles a ``None`` result by setting ``runtime_presence="unknown"``
+        and leaving ``status``/``error`` alone.
+
+        Node data is grouped by the path it was reported under DURING the
+        walk (never accumulated into flat dicts as records are visited), so
+        a same-named collision reported at a different, unowned path can
+        never contribute even a single node to the accepted result: only
+        the one group whose path exactly matches ``self._topo_path(
+        instance_name)`` is ever read from, after the walk completes. A
+        single flat accumulator keyed only by logical node name — with a
+        separate "last path seen" variable checked once at the end — would
+        let an untrusted record's nodes survive being overwritten by a
+        later, legitimately-pathed record's path check while still keeping
+        entries an earlier, unverified record contributed; grouping by path
+        closes that gap by construction.
+
+        Assumes ``inspect --all --format json`` reports the same per-node
+        ``name``/``ipv4_address``/``kind`` fields :meth:`_deploy_unlocked`
+        already relies on from ``deploy``'s own JSON output — both are the
+        same underlying containerlab container inventory, so this is a
+        reasonable assumption, but (like the sudo/session-propagation
+        caveat already documented on :func:`_terminate_process_group`) it
+        cannot be fully proven from this repository alone and should be
+        spot-checked against the real lab host as part of rollout.
+
+        Unlocked — see :meth:`_inspect_lab_paths_unlocked`.
+        """
+        raw = self._inspect_all()
+        prefix = f"clab-{instance_name}-"
+        # path -> {logical_name: (cname, ip, kind)}. A record with no
+        # discoverable path groups under the ``None`` key, which can never
+        # equal ``self._topo_path(instance_name)`` (that method always
+        # returns a non-empty string), so such records are structurally
+        # excluded from ever being accepted.
+        groups: dict[str | None, dict[str, tuple[str, str, str]]] = {}
+
+        def _walk(value: object, hinted_name: str | None = None) -> None:
+            if isinstance(value, dict):
+                lab_name = value.get("lab_name")
+                if not isinstance(lab_name, str) or not lab_name:
+                    lab_name = hinted_name
+                if lab_name == instance_name:
+                    path = value.get("absLabPath") or value.get("labPath")
+                    group_key = path if isinstance(path, str) and path else None
+                    cname = value.get("name")
+                    if isinstance(cname, str) and cname:
+                        logical = (
+                            cname[len(prefix):]
+                            if cname.startswith(prefix)
+                            else cname.split("-")[-1]
+                        )
+                        ip = (value.get("ipv4_address") or "").split("/")[0]
+                        kind = value.get("kind", "linux")
+                        group = groups.setdefault(group_key, {})
+                        group[logical] = (cname, ip, kind)
+                for key, child in value.items():
+                    child_hint = key if isinstance(child, list) else lab_name
+                    _walk(child, child_hint)
+            elif isinstance(value, list):
+                for child in value:
+                    _walk(child, hinted_name)
+
+        _walk(raw)
+        expected_path = self._topo_path(instance_name)
+        group = groups.get(expected_path)
+        if not group:
+            return None
+        nodes = {logical: cname for logical, (cname, _ip, _kind) in group.items()}
+        mgmt = {logical: ip for logical, (_cname, ip, _kind) in group.items()}
+        kinds = {logical: kind for logical, (_cname, _ip, kind) in group.items()}
+        return LabHandle(instance_name=instance_name, nodes=nodes, mgmt=mgmt, kinds=kinds)
+
+    def inspect_running(self, instance_name: str) -> LabHandle | None:
+        self._require_lab_host()
+        with host_lock(self.lock_label, directory=self.workdir):
+            return self._inspect_running_handle_unlocked(instance_name)
 
     def console_target(self, handle: LabHandle, node: str) -> str:
         return handle.nodes[node]

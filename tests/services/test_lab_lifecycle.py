@@ -884,6 +884,332 @@ def test_destroy_success_sets_absent(admin_session, tenant_a):
     admin_session.rollback()
 
 
+def test_resync_present_preliminary_escalates_a_transient_status_when_ambiguous(
+    admin_session, tenant_a, monkeypatch
+):
+    """Unit-level proof of Finding A's escalation for
+    ``resync_present_preliminary`` itself — not ``provision_if_absent``'s
+    identical branch (covered end-to-end in
+    ``test_lab_operations_worker.py``'s
+    ``test_conditional_deploy_fully_ambiguous_outcome_escalates_a_transient_prior_status``,
+    which only exercises ``provision_if_absent``'s copy of this logic).
+
+    The preliminary ``engine.status()`` check already found the runtime
+    present, so ``resync_present_preliminary`` runs
+    ``_rebuild_consoles_from_live_inspection`` directly. The instance starts
+    at ``status="provisioning"`` — a legitimate transient value, not
+    "active" — and the follow-up ``engine.inspect_running`` returns
+    ``None`` (the ``handle is None`` path), leaving
+    ``runtime_presence="unknown"`` with no positive proof either way.
+    Restoring/leaving "provisioning" in place would match
+    ``reconcile_stuck``'s own stuck-row sweep trigger shape once this
+    operation closes with no open operation left to protect it, so it must
+    be escalated to ``"error"`` with a non-empty message instead."""
+    _c, act, _lt, p = _seed(admin_session, tenant_a.id)
+    inst = LabInstance(tenant_id=tenant_a.id, activity_id=act.id, person_id=p.id,
+                       instance_name="dal-resync-prelim-ambiguous", seed={"o": 5},
+                       status="provisioning", consoles={"stale": {"kind": "linux"}})
+    inst.runtime_presence = "unknown"
+    inst.error = None
+    admin_session.add(inst)
+    admin_session.flush()
+
+    stopped = []
+    monkeypatch.setattr(lab_lifecycle, "stop_consoles", lambda i: stopped.append(i.id))
+
+    engine = MagicMock()
+    engine.inspect_running.return_value = None  # handle-is-None path: fully ambiguous
+
+    out = lab_lifecycle.resync_present_preliminary(admin_session, inst, engine)
+    admin_session.flush()
+
+    assert stopped == []  # never confirmed present; nothing torn down
+    assert out.runtime_presence == "unknown"
+    assert out.status == "error"
+    assert out.status != "provisioning"
+    assert out.error
+    admin_session.rollback()
+
+
+def test_provision_if_absent_deploys_when_precondition_holds(admin_session, tenant_a):
+    """Precondition (absent) confirmed by ``deploy_if_absent`` returning a
+    real handle: proceeds exactly like an ordinary successful deploy."""
+    _c, act, lt, p = _seed(admin_session, tenant_a.id)
+    inst = LabInstance(tenant_id=tenant_a.id, activity_id=act.id, person_id=p.id,
+                       instance_name="dal-cond-deploy-ok", seed={"o": 5},
+                       status="provisioning", consoles={})
+    inst.runtime_presence = "unknown"
+    admin_session.add(inst)
+    admin_session.flush()
+    engine = MagicMock()
+    engine.deploy_if_absent.return_value = LabHandle(
+        instance_name="dal-cond-deploy-ok", nodes={"client": "clab-x-client"},
+        mgmt={"client": "172.20.20.3"}, kinds={"client": "linux"})
+    out = lab_lifecycle.provision_if_absent(
+        admin_session, inst, engine, lt,
+        preserved_status="active", preserved_error=None,
+    )
+    admin_session.flush()
+    assert out.status == "active"
+    assert out.runtime_presence == "present"
+    assert out.consoles["client"]["mgmt"] == "172.20.20.3"
+    assert out.started_at is not None
+    engine.deploy_if_absent.assert_called_once()
+    admin_session.rollback()
+
+
+def test_provision_if_absent_resyncs_stale_consoles_when_precondition_mismatched(
+    admin_session, tenant_a, monkeypatch
+):
+    """``deploy_if_absent`` returning ``None`` means the runtime was found
+    genuinely present. ``engine.deploy``/topology mutation are never called
+    on this path, but ANY pre-existing ``consoles`` are torn down and
+    resynced from a fresh, authoritative inspection — never preserved as-is
+    — because a conditional deploy's own target instance routinely already
+    carries stale console data from before the runtime it is repairing ever
+    disappeared (see ``_rebuild_consoles_from_live_inspection``'s own
+    docstring)."""
+    _c, act, lt, p = _seed(admin_session, tenant_a.id)
+    inst = LabInstance(tenant_id=tenant_a.id, activity_id=act.id, person_id=p.id,
+                       instance_name="dal-cond-deploy-noop", seed={"o": 5},
+                       status="provisioning", consoles={"stale": {"kind": "linux"}})
+    inst.runtime_presence = "unknown"
+    inst.error = "stale error text"
+    admin_session.add(inst)
+    admin_session.flush()
+
+    stopped = []
+    monkeypatch.setattr(lab_lifecycle, "stop_consoles", lambda i: stopped.append(i.id))
+
+    engine = MagicMock()
+    engine.deploy_if_absent.return_value = None  # precondition mismatch: genuinely present
+    engine.inspect_running.return_value = LabHandle(
+        instance_name="dal-cond-deploy-noop", nodes={"client": "clab-x-client"},
+        mgmt={"client": "172.20.20.8"}, kinds={"client": "linux"})
+
+    out = lab_lifecycle.provision_if_absent(
+        admin_session, inst, engine, lt,
+        preserved_status="active", preserved_error="stale error text",
+    )
+    admin_session.flush()
+    assert out.status == "active"
+    assert out.error is None
+    # Resynced to fresh, live console data — NOT the stale "stale" placeholder.
+    assert out.consoles == {"client": {"kind": "linux", "mgmt": "172.20.20.8", "port": None}}
+    assert out.runtime_presence == "present"
+    assert stopped == [inst.id]  # the stale consoles were actually torn down
+    engine.deploy.assert_not_called()
+    engine.inspect_running.assert_called_once_with("dal-cond-deploy-noop")
+    admin_session.rollback()
+
+
+def test_provision_if_absent_resyncs_from_a_live_inspection_when_consoles_are_empty(
+    admin_session, tenant_a
+):
+    """``deploy_if_absent`` returns ``None`` (runtime present) AND consoles
+    are empty — the crash-then-retry gap: this instance's own prior,
+    crashed attempt most plausibly already deployed successfully but never
+    recorded consoles/status. A real, fresh inspection (engine.
+    inspect_running, never a redeploy) must resync to the exact same end
+    state a normal successful deploy would reach."""
+    _c, act, lt, p = _seed(admin_session, tenant_a.id)
+    inst = LabInstance(tenant_id=tenant_a.id, activity_id=act.id, person_id=p.id,
+                       instance_name="dal-cond-deploy-resync", seed={"o": 5},
+                       status="provisioning", consoles={})
+    inst.runtime_presence = "unknown"
+    admin_session.add(inst)
+    admin_session.flush()
+
+    engine = MagicMock()
+    engine.deploy_if_absent.return_value = None  # precondition mismatch: genuinely present
+    engine.inspect_running.return_value = LabHandle(
+        instance_name="dal-cond-deploy-resync", nodes={"client": "clab-x-client"},
+        mgmt={"client": "172.20.20.7"}, kinds={"client": "linux"})
+
+    out = lab_lifecycle.provision_if_absent(
+        admin_session, inst, engine, lt,
+        preserved_status="active", preserved_error=None,
+    )
+    admin_session.flush()
+    assert out.status == "active"
+    assert out.error is None
+    assert out.consoles["client"]["mgmt"] == "172.20.20.7"
+    assert out.runtime_presence == "present"
+    engine.inspect_running.assert_called_once_with("dal-cond-deploy-resync")
+    engine.deploy.assert_not_called()
+    admin_session.rollback()
+
+
+def test_provision_if_absent_resync_sets_unknown_when_the_fresh_inspection_disagrees(
+    admin_session, tenant_a
+):
+    """A genuinely unexpected disagreement (the fresh inspection no longer
+    finds the instance running) must not assert a lifecycle state with no
+    real console data behind it — presence is conservatively set to
+    "unknown". ``status``/``error`` are restored to the caller's
+    ``preserved_status``/``preserved_error`` (the TRUE pre-admission
+    values) rather than left at the earlier, already-committed capacity-
+    admission transaction's transient "provisioning"/"resetting"
+    reservation placeholder: no ordinary settle path ever produces that
+    placeholder on its own, and leaving it in place would let
+    ``reconcile_stuck``'s stuck-row sweep later force this row through an
+    unconditional, potentially destructive destroy+redeploy cycle against a
+    runtime this conditional operation had correctly declined to touch."""
+    _c, act, lt, p = _seed(admin_session, tenant_a.id)
+    inst = LabInstance(tenant_id=tenant_a.id, activity_id=act.id, person_id=p.id,
+                       instance_name="dal-cond-deploy-resync-miss", seed={"o": 5},
+                       status="provisioning", consoles={})
+    inst.runtime_presence = "unknown"
+    admin_session.add(inst)
+    admin_session.flush()
+
+    engine = MagicMock()
+    engine.deploy_if_absent.return_value = None
+    engine.inspect_running.return_value = None  # disagrees: not actually running
+
+    out = lab_lifecycle.provision_if_absent(
+        admin_session, inst, engine, lt,
+        preserved_status="active", preserved_error=None,
+    )
+    admin_session.flush()
+    assert out.status == "active"  # restored to the true pre-admission status
+    assert out.error is None
+    assert out.consoles == {}
+    assert out.runtime_presence == "unknown"
+    admin_session.rollback()
+
+
+def test_provision_if_absent_resync_never_tears_down_consoles_when_handle_is_none(
+    admin_session, tenant_a, monkeypatch
+):
+    """``_rebuild_consoles_from_live_inspection`` must not call
+    ``stop_consoles`` on the ``handle is None`` outcome either — not just
+    the raise case. The runtime is genuinely present on this code path (that
+    is why a resync was attempted), so if a fresh inspection cannot confirm
+    a handle, we have no positive proof either way and must not destroy an
+    existing, possibly still-working console with nothing to rebuild it.
+    Pre-existing ``consoles``/``status``/``error`` are left completely
+    unchanged; only ``runtime_presence`` moves to "unknown"."""
+    _c, act, lt, p = _seed(admin_session, tenant_a.id)
+    stale_consoles = {"stale": {"kind": "linux"}}
+    inst = LabInstance(tenant_id=tenant_a.id, activity_id=act.id, person_id=p.id,
+                       instance_name="dal-cond-deploy-handle-none", seed={"o": 5},
+                       status="provisioning", consoles=dict(stale_consoles))
+    inst.runtime_presence = "unknown"
+    inst.error = "stale error text"
+    admin_session.add(inst)
+    admin_session.flush()
+
+    stopped = []
+    monkeypatch.setattr(lab_lifecycle, "stop_consoles", lambda i: stopped.append(i.id))
+
+    engine = MagicMock()
+    engine.deploy_if_absent.return_value = None  # precondition mismatch: genuinely present
+    engine.inspect_running.return_value = None  # follow-up inspection also can't confirm
+
+    out = lab_lifecycle.provision_if_absent(
+        admin_session, inst, engine, lt,
+        preserved_status="active", preserved_error=None,
+    )
+    admin_session.flush()
+    assert stopped == []  # stop_consoles never called
+    assert out.consoles == stale_consoles  # completely unchanged
+    assert out.runtime_presence == "unknown"
+    admin_session.rollback()
+
+
+def test_provision_if_absent_resync_never_tears_down_consoles_when_inspection_raises(
+    admin_session, tenant_a, monkeypatch
+):
+    """``_rebuild_consoles_from_live_inspection`` must call
+    ``engine.inspect_running`` BEFORE ``stop_consoles`` — never the reverse.
+
+    ``inspect_running`` (-> ``_inspect_running_handle_unlocked`` ->
+    ``_inspect_all``) is fallible for real, ordinary reasons: a non-zero
+    ``containerlab inspect`` return code or invalid JSON both raise
+    ``RuntimeError``. If ``stop_consoles`` ran first, such a raise would
+    leave real, already-destroyed console processes behind with no way to
+    rebuild them and no self-healing reconciler path back (the runtime is
+    genuinely present in this exact code path, so it is not
+    "missing_runtime" either). This proves the fix: the exception
+    propagates, and ``stop_consoles`` is never called at all."""
+    _c, act, lt, p = _seed(admin_session, tenant_a.id)
+    inst = LabInstance(tenant_id=tenant_a.id, activity_id=act.id, person_id=p.id,
+                       instance_name="dal-cond-deploy-inspect-fails", seed={"o": 5},
+                       status="provisioning", consoles={"stale": {"kind": "linux"}})
+    inst.runtime_presence = "unknown"
+    admin_session.add(inst)
+    admin_session.flush()
+
+    stopped = []
+    monkeypatch.setattr(lab_lifecycle, "stop_consoles", lambda i: stopped.append(i.id))
+
+    engine = MagicMock()
+    engine.deploy_if_absent.return_value = None  # precondition mismatch: genuinely present
+    engine.inspect_running.side_effect = RuntimeError("inspect failed")
+
+    with pytest.raises(RuntimeError, match="inspect failed"):
+        lab_lifecycle.provision_if_absent(
+            admin_session, inst, engine, lt,
+            preserved_status="active", preserved_error=None,
+        )
+    assert stopped == []  # no destructive teardown occurred before the failure
+    engine.inspect_running.assert_called_once_with("dal-cond-deploy-inspect-fails")
+    admin_session.rollback()
+
+
+def test_destroy_if_present_destroys_and_stops_consoles_only_after_real_destroy(
+    admin_session, tenant_a, monkeypatch
+):
+    _c, act, _lt, p = _seed(admin_session, tenant_a.id)
+    inst = LabInstance(tenant_id=tenant_a.id, activity_id=act.id, person_id=p.id,
+                       instance_name="dal-cond-destroy-ok", seed={"o": 5}, status="active",
+                       consoles={"client": {"kind": "linux"}})
+    inst.runtime_presence = "present"
+    admin_session.add(inst)
+    admin_session.flush()
+    order = []
+    monkeypatch.setattr(lab_lifecycle, "stop_consoles", lambda i: order.append("stop_consoles"))
+    engine = MagicMock()
+    engine.destroy_if_present.side_effect = lambda name: order.append("destroy_if_present") or True
+
+    out = lab_lifecycle.destroy_if_present(admin_session, inst, engine)
+    admin_session.flush()
+    assert out.status == "reaped"
+    assert out.runtime_presence == "absent"
+    assert order == ["destroy_if_present", "stop_consoles"]  # destroy before teardown
+    admin_session.rollback()
+
+
+def test_destroy_if_present_settles_noop_without_any_mutation_when_precondition_mismatched(
+    admin_session, tenant_a, monkeypatch
+):
+    """``destroy_if_present`` returning ``False`` means the runtime was
+    already absent — this is the no-op path. status/error/consoles stay
+    exactly as they were; only runtime_presence is refreshed to "absent"."""
+    _c, act, _lt, p = _seed(admin_session, tenant_a.id)
+    inst = LabInstance(tenant_id=tenant_a.id, activity_id=act.id, person_id=p.id,
+                       instance_name="dal-cond-destroy-noop", seed={"o": 5}, status="reaped",
+                       consoles={"client": {"kind": "linux"}})
+    inst.error = "pre-existing error"
+    inst.runtime_presence = "unknown"
+    admin_session.add(inst)
+    admin_session.flush()
+    stopped = []
+    monkeypatch.setattr(lab_lifecycle, "stop_consoles", lambda i: stopped.append(i.id))
+    engine = MagicMock()
+    engine.destroy_if_present.return_value = False
+
+    out = lab_lifecycle.destroy_if_present(admin_session, inst, engine)
+    admin_session.flush()
+    assert out.status == "reaped"  # untouched
+    assert out.error == "pre-existing error"  # untouched
+    assert out.consoles == {"client": {"kind": "linux"}}  # untouched
+    assert out.runtime_presence == "absent"  # refreshed from the fresh observation
+    assert stopped == []  # no console teardown on the no-op path
+    admin_session.rollback()
+
+
 def test_the_no_real_spawn_guard_still_bites():
     """The guard is about the NEXT forgotten patch, not the last one.
 

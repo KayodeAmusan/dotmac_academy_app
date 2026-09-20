@@ -18,7 +18,7 @@ from app.models.assessment import Activity, Submission
 from app.models.course import Course
 from app.models.lab import LabInstance, LabOperation, LabTemplate
 from app.models.person import Person
-from app.services import host_lock, lab_jobs, lab_operations
+from app.services import host_lock, lab_jobs, lab_lifecycle, lab_operations
 from app.services.exceptions import ConflictError
 from app.services.labengine.containerlab import ContainerlabEngine
 from app.services.labengine.interface import LabHandle
@@ -1143,6 +1143,70 @@ def test_stuck_destroy_claim_escalates_instance_via_reconcile_stuck(
     )
 
 
+def test_stuck_repair_deploy_claim_escalates_instance_via_reconcile_stuck(
+    admin_session, tenant_a
+):
+    """Mirrors ``test_stuck_destroy_claim_escalates_instance_via_reconcile_
+    stuck`` for the deploy side of the same problem: a conditional
+    (``origin="runtime_repair"``, ``requested_by=None``) repair deploy that
+    exhausts its attempts via lease expiry (worker crash/hang), not a
+    synchronous exception, must escalate the same way a synchronously-failing
+    repair deploy does — otherwise a hanging engine lets ``reconcile_
+    runtime``'s ``missing_runtime`` branch re-enqueue repair deploys for this
+    instance forever."""
+    instance, _ = _seed(
+        admin_session, tenant_a.id, name="stuck-repair-deploy-escalate", status="active"
+    )
+    threshold = lab_operations.MAX_ATTEMPTS_BY_KIND["deploy"]
+    engine = MagicMock()
+    engine.status.return_value = "absent"
+    engine.deploy_if_absent.side_effect = RuntimeError("containerlab wedged")
+
+    for _ in range(threshold - 1):
+        operation = lab_operations.enqueue(
+            admin_session,
+            instance=instance,
+            kind="deploy",
+            requested_by=None,
+            origin="runtime_repair",
+            runtime_precondition="absent",
+        )
+        operation.state = "claimed"
+        operation.claimed_by = "worker"
+        operation.claimed_at = datetime.now(UTC)
+        operation.heartbeat_at = datetime.now(UTC)
+        admin_session.commit()
+        lab_operations.run_claimed(
+            admin_session, operation_id=operation.id, claimed_by="worker", engine=engine
+        )
+    admin_session.refresh(instance)
+    assert instance.status == "active"
+
+    stuck_operation = lab_operations.enqueue(
+        admin_session,
+        instance=instance,
+        kind="deploy",
+        requested_by=None,
+        origin="runtime_repair",
+        runtime_precondition="absent",
+    )
+    stuck_operation.state = "claimed"
+    stuck_operation.claimed_by = "stale-worker"
+    stuck_operation.claimed_at = datetime.now(UTC) - timedelta(hours=1)
+    stuck_operation.heartbeat_at = datetime.now(UTC) - timedelta(hours=1)
+    stuck_operation.attempts = threshold
+    admin_session.commit()
+
+    assert lab_operations.reconcile_stuck(admin_session, lease_seconds=60) == 1
+    admin_session.refresh(instance)
+    admin_session.refresh(stuck_operation)
+    assert stuck_operation.state == "failed"
+    assert instance.status == "error"
+    assert instance.error == (
+        f"automatic repair deploy failed {threshold} times; manual intervention required"
+    )
+
+
 def test_single_stuck_destroy_row_escalates_via_reconcile_stuck_alone(
     admin_session, tenant_a
 ):
@@ -1356,6 +1420,51 @@ def test_capacity_deferral_preserves_presence(admin_session, tenant_a, monkeypat
     admin_session.refresh(retry)
     assert retry.status == "queued"
     assert retry.runtime_presence == "absent"  # untouched — never became capacity-counted
+
+
+def test_conditional_deploy_capacity_deferral_preserves_conditional_shape(
+    admin_session, tenant_a, monkeypatch
+):
+    """The `is_conditional_deploy` branch's own capacity check
+    (`if not _capacity_available(db, instance): _requeue_for_capacity(...)`)
+    reuses the same shared helper already covered for the ORDINARY deploy
+    path, but had no dedicated test for a conditional repair deploy. A
+    capacity deferral must never touch the conditional shape (`origin`/
+    `runtime_precondition`) on the requeued row."""
+    blocker, _ = _seed(admin_session, tenant_a.id, name="cond-deferral-blocker", status="active")
+    admin_session.commit()
+    monkeypatch.setattr(settings, "max_concurrent_labs", 1)
+
+    retry, person = _seed(
+        admin_session, tenant_a.id, name="cond-deferral-retry", status="active", presence="absent",
+    )
+    operation = lab_operations.enqueue(
+        admin_session,
+        instance=retry,
+        kind="deploy",
+        requested_by=None,
+        origin="runtime_repair",
+        runtime_precondition="absent",
+    )
+    admin_session.commit()
+    claimed = lab_operations.claim_next(admin_session, claimed_by="worker")
+    assert claimed is not None and claimed.id == operation.id
+    admin_session.commit()
+    admin_session.refresh(operation)
+    attempts_at_claim = operation.attempts
+
+    outcome = lab_operations.run_claimed(
+        admin_session, operation_id=operation.id, claimed_by="worker", engine=_engine(retry.instance_name),
+    )
+    assert outcome == "deferred"
+    admin_session.refresh(retry)
+    admin_session.refresh(operation)
+    assert retry.status == "queued"
+    assert operation.state == "queued"
+    assert operation.attempts == max(attempts_at_claim - 1, 0)
+    # A capacity deferral never touches the conditional shape.
+    assert operation.origin == "runtime_repair"
+    assert operation.runtime_precondition == "absent"
 
 
 def test_already_consuming_presence_is_admitted_even_when_cap_is_full(
@@ -2144,6 +2253,54 @@ def test_reclaim_previous_epoch_escalates_automatic_destroy_at_ceiling(
     assert instance.runtime_presence == "unknown"
 
 
+def test_reclaim_previous_epoch_escalates_automatic_repair_deploy_at_ceiling(
+    admin_session, tenant_a
+):
+    """A conditional (``origin="runtime_repair"``, ``requested_by=None``)
+    repair deploy already at the deploy attempt ceiling, when matched by a
+    restart-reclaim scan, must trigger the same escalation-to-"error" path
+    `reconcile_stuck`'s own ceiling branch already applies — a crashing
+    worker must not be able to dodge escalation just because it never lived
+    long enough to hit `reconcile_stuck`'s lease-expiry check first. Mirrors
+    `test_reclaim_previous_epoch_escalates_automatic_destroy_at_ceiling`."""
+    instance, _ = _seed(
+        admin_session, tenant_a.id, name="reclaim-repair-deploy-escalate", status="active"
+    )
+    threshold = lab_operations.MAX_ATTEMPTS_BY_KIND["deploy"]
+    operation = lab_operations.enqueue(
+        admin_session,
+        instance=instance,
+        kind="deploy",
+        requested_by=None,
+        origin="runtime_repair",
+        runtime_precondition="absent",
+    )
+    _claim_row(
+        operation,
+        claimed_by="host-a:111:oldboot",
+        claimed_host="host-a",
+        claimed_epoch="111:oldboot",
+    )
+    operation.attempts = threshold
+    admin_session.commit()
+
+    assert (
+        lab_operations.reclaim_previous_epoch(admin_session, host="host-a", epoch="222:newboot")
+        == 1
+    )
+    admin_session.commit()
+    admin_session.refresh(operation)
+    admin_session.refresh(instance)
+
+    assert operation.state == "failed"
+    assert operation.attempts == threshold  # not refunded
+    assert instance.status == "error"
+    assert instance.error == (
+        f"automatic repair deploy failed {threshold} times; manual intervention required"
+    )
+    assert instance.runtime_presence == "unknown"
+
+
 def test_reclaim_previous_epoch_lock_wait_is_bounded_by_lock_timeout(
     admin_engine, admin_session, tenant_a
 ):
@@ -2189,3 +2346,962 @@ def test_reclaim_previous_epoch_lock_wait_is_bounded_by_lock_timeout(
         admin_session.rollback()
         holder.rollback()
         holder.close()
+
+
+# --- Conditional operations (migration 0060_lab_conditional_ops) -----------
+
+
+def _claim(db, operation, *, claimed_by="worker"):
+    """Claim ``operation`` by hand, mirroring ``claim_next``'s attempt charge
+    (``op.attempts += 1``) so a HostLockUnavailable-triggered refund is
+    actually observable (from a nonzero starting value), not trivially
+    "0 minus 1, floored back to 0" either way."""
+    operation.state = "claimed"
+    operation.claimed_by = claimed_by
+    operation.claimed_at = datetime.now(UTC)
+    operation.heartbeat_at = datetime.now(UTC)
+    operation.attempts += 1
+    db.commit()
+
+
+def test_conditional_deploy_crash_then_reclaim_then_retry_resyncs_consoles_and_status(
+    admin_session, tenant_a
+):
+    """Reproduces the exact crash-then-retry gap: a conditional deploy's
+    ``deploy_if_absent()`` genuinely succeeds, but the worker process crashes
+    before ``provision_if_absent`` ever records ``consoles``/``status``.
+    ``reclaim_previous_epoch`` requeues the still-``claimed`` row (projecting
+    a defensive, stale ``status``/``runtime_presence`` it has no way to know
+    is wrong). A second worker then claims the SAME operation; its
+    preliminary check correctly observes the runtime IS present (it really
+    was deployed). Without the resync fix, this would settle "succeeded"
+    with empty ``consoles`` and a stale, non-"active" ``status`` — a live,
+    running lab that looks like nothing happened. With the fix, the
+    preliminary-present path detects the empty ``consoles`` and performs a
+    real inspection to converge on the same end state a normal successful
+    deploy would reach.
+    """
+    instance, _person = _seed(
+        admin_session, tenant_a.id, name="cond-deploy-crash-resync",
+        status="queued", presence="absent",
+    )
+    operation = lab_operations.enqueue(
+        admin_session,
+        instance=instance,
+        kind="deploy",
+        requested_by=None,
+        origin="runtime_repair",
+        runtime_precondition="absent",
+    )
+    # First worker incarnation claims the row.
+    _claim_row(
+        operation, claimed_by="host-a:1:boot1", claimed_host="host-a", claimed_epoch="1:boot1",
+    )
+    operation.attempts = 1
+    admin_session.commit()
+
+    # Simulate run_claimed's capacity-admission reservation commit — this is
+    # the durable, pre-slow-work checkpoint that genuinely happens before
+    # deploy_if_absent() is ever called, and it is the ONLY DB state a crash
+    # immediately after a genuinely successful deploy_if_absent() would ever
+    # leave behind (provision_if_absent's own success projection — building
+    # consoles, setting status="active" — never got to run).
+    instance.status = "provisioning"
+    instance.runtime_presence = "unknown"
+    admin_session.commit()
+
+    # The worker process crashes here — never runs provision_if_absent's
+    # console/status projection, despite the runtime genuinely now running.
+    # A fresh worker incarnation's startup reclaim requeues this claim.
+    reclaimed = lab_operations.reclaim_previous_epoch(
+        admin_session, host="host-a", epoch="2:boot2"
+    )
+    admin_session.commit()
+    assert reclaimed == 1
+    admin_session.refresh(operation)
+    admin_session.refresh(instance)
+    assert operation.state == "queued"
+    assert instance.status == "queued"  # provisioning -> queued, same as reconcile_stuck
+    assert instance.consoles == {}  # never recorded — the crash gap
+
+    # The new worker incarnation claims the same operation and retries.
+    _claim_row(
+        operation, claimed_by="host-a:2:boot2", claimed_host="host-a", claimed_epoch="2:boot2",
+    )
+    operation.attempts += 1
+    admin_session.commit()
+
+    engine = _engine(instance.instance_name)
+    # Preliminary check correctly observes the runtime IS present — it
+    # really was deployed by the crashed attempt.
+    engine.status.return_value = "running"
+    engine.inspect_running.return_value = LabHandle(
+        instance_name=instance.instance_name,
+        nodes={"client": f"clab-{instance.instance_name}-client"},
+        mgmt={"client": "172.20.20.9"},
+        kinds={"client": "linux"},
+    )
+
+    assert lab_operations.run_claimed(
+        admin_session, operation_id=operation.id, claimed_by="host-a:2:boot2", engine=engine,
+    ) == "succeeded"
+
+    admin_session.refresh(instance)
+    admin_session.refresh(operation)
+    assert operation.state == "succeeded"
+    # The gap this test guards against: without the resync fix, this would
+    # be "queued" with empty consoles despite a genuinely running lab.
+    assert instance.status == "active"
+    assert instance.consoles != {}
+    assert instance.consoles["client"]["mgmt"] == "172.20.20.9"
+    assert instance.runtime_presence == "present"
+    engine.inspect_running.assert_called_once()
+    engine.deploy_if_absent.assert_not_called()  # preliminary short-circuit, never reached
+
+
+def test_conditional_deploy_precondition_holds_deploys_and_succeeds(admin_session, tenant_a):
+    instance, _person = _seed(
+        admin_session, tenant_a.id, name="cond-deploy-ok", status="active", presence="unknown"
+    )
+    instance.error = "worker lease expired; operation requeued"
+    operation = lab_operations.enqueue(
+        admin_session,
+        instance=instance,
+        kind="deploy",
+        requested_by=None,
+        origin="runtime_repair",
+        runtime_precondition="absent",
+    )
+    _claim(admin_session, operation)
+    engine = _engine(instance.instance_name)
+    engine.status.return_value = "absent"  # preliminary check: genuinely absent
+    engine.deploy_if_absent.return_value = LabHandle(
+        instance_name=instance.instance_name, nodes={}, mgmt={}, kinds={},
+    )
+
+    assert lab_operations.run_claimed(
+        admin_session, operation_id=operation.id, claimed_by="worker", engine=engine,
+    ) == "succeeded"
+    admin_session.refresh(instance)
+    admin_session.refresh(operation)
+    assert instance.status == "active"
+    assert instance.runtime_presence == "present"
+    assert operation.state == "succeeded"
+    engine.deploy_if_absent.assert_called_once()
+    engine.deploy.assert_not_called()
+
+
+def test_conditional_deploy_precondition_mismatch_at_preliminary_check_resyncs_stale_consoles(
+    admin_session, tenant_a, monkeypatch
+):
+    """The preliminary check alone (before any capacity admission) finds the
+    runtime already present: settle as a successful no-op with respect to
+    ``deploy_if_absent``/``engine.deploy`` (never called), but ALWAYS resync
+    ``consoles``/``status`` from a fresh, authoritative inspection — never a
+    bare trust-and-skip of whatever is currently recorded.
+
+    ``instance.consoles`` starts NON-EMPTY here on purpose: this is the
+    realistic ``missing_runtime``-repair starting condition (an instance
+    whose runtime disappeared while it was genuinely active still carries
+    its old, now-stale console data) — proving the fix for the case Codex's
+    round-3 review found the empty/non-empty heuristic got wrong.
+    """
+    instance, _person = _seed(
+        admin_session, tenant_a.id, name="cond-deploy-prelim-stale-resync",
+        status="active", presence="unknown",
+    )
+    instance.error = "containerlab runtime is absent"
+    instance.consoles = {"client": {"kind": "linux", "mgmt": "10.0.0.5", "port": 1111}}
+    admin_session.flush()
+    operation = lab_operations.enqueue(
+        admin_session,
+        instance=instance,
+        kind="deploy",
+        requested_by=None,
+        origin="runtime_repair",
+        runtime_precondition="absent",
+    )
+    _claim(admin_session, operation)
+    engine = _engine(instance.instance_name)
+    engine.status.return_value = "running"  # preliminary check: genuinely present
+    engine.inspect_running.return_value = LabHandle(
+        instance_name=instance.instance_name,
+        nodes={"client": f"clab-{instance.instance_name}-client"},
+        mgmt={"client": "172.20.20.11"},
+        kinds={"client": "linux"},
+    )
+
+    stop_calls = []
+    monkeypatch.setattr(lab_lifecycle, "stop_consoles", lambda i: stop_calls.append(i.id))
+
+    assert lab_operations.run_claimed(
+        admin_session, operation_id=operation.id, claimed_by="worker", engine=engine,
+    ) == "succeeded"
+    admin_session.refresh(instance)
+    admin_session.refresh(operation)
+    assert instance.status == "active"
+    assert instance.error is None
+    # Resynced to the fresh, live console data — NOT the stale placeholder.
+    assert instance.consoles["client"]["mgmt"] == "172.20.20.11"
+    assert instance.runtime_presence == "present"
+    assert stop_calls == [instance.id]  # stale consoles were actually torn down
+    engine.inspect_running.assert_called_once()
+    engine.deploy_if_absent.assert_not_called()
+    engine.deploy.assert_not_called()
+
+
+def test_conditional_deploy_precondition_mismatch_at_preliminary_check_resyncs_from_empty_consoles(
+    admin_session, tenant_a, monkeypatch
+):
+    """Same preliminary-present no-op path, starting from EMPTY consoles —
+    still a valid case now that the code no longer branches on emptiness;
+    it should still resync correctly."""
+    instance, _person = _seed(
+        admin_session, tenant_a.id, name="cond-deploy-prelim-empty-resync",
+        status="active", presence="unknown",
+    )
+    instance.error = None
+    admin_session.flush()
+    operation = lab_operations.enqueue(
+        admin_session,
+        instance=instance,
+        kind="deploy",
+        requested_by=None,
+        origin="runtime_repair",
+        runtime_precondition="absent",
+    )
+    _claim(admin_session, operation)
+    engine = _engine(instance.instance_name)
+    engine.status.return_value = "running"  # preliminary check: genuinely present
+    engine.inspect_running.return_value = LabHandle(
+        instance_name=instance.instance_name,
+        nodes={"client": f"clab-{instance.instance_name}-client"},
+        mgmt={"client": "172.20.20.12"},
+        kinds={"client": "linux"},
+    )
+
+    stop_calls = []
+    monkeypatch.setattr(lab_lifecycle, "stop_consoles", lambda i: stop_calls.append(i.id))
+
+    assert lab_operations.run_claimed(
+        admin_session, operation_id=operation.id, claimed_by="worker", engine=engine,
+    ) == "succeeded"
+    admin_session.refresh(instance)
+    admin_session.refresh(operation)
+    assert instance.status == "active"
+    assert instance.error is None
+    assert instance.consoles["client"]["mgmt"] == "172.20.20.12"
+    assert instance.runtime_presence == "present"
+    assert stop_calls == [instance.id]  # unconditional — harmless no-op on already-empty consoles
+    engine.inspect_running.assert_called_once()
+    engine.deploy_if_absent.assert_not_called()
+    engine.deploy.assert_not_called()
+
+
+def test_conditional_deploy_authoritative_check_catches_a_race_the_preliminary_check_missed(
+    admin_session, tenant_a, monkeypatch
+):
+    """The preliminary check says absent, but a race makes the runtime
+    genuinely present by the time deploy_if_absent's own lock-protected check
+    runs — proves the SECOND (authoritative) check is the one that actually
+    matters, not the first.
+
+    ``consoles`` is pre-populated here with STALE data — a conditional
+    deploy's own target instance is, by construction, one whose runtime was
+    flagged missing while its lifecycle status still said active, so any
+    pre-existing ``consoles`` on it are untrustworthy regardless of why the
+    mismatch was caught (crash-then-retry or a genuine, narrower race) — see
+    ``lab_lifecycle._rebuild_consoles_from_live_inspection``'s own docstring.
+    The mismatch path always resyncs from a fresh inspection; there is no
+    "preserve as-is" branch.
+    """
+    instance, _person = _seed(
+        admin_session, tenant_a.id, name="cond-deploy-race",
+        status="active", presence="unknown",
+    )
+    instance.error = None
+    instance.consoles = {"client": {"kind": "linux", "mgmt": "10.0.0.5"}}
+    admin_session.flush()
+    operation = lab_operations.enqueue(
+        admin_session,
+        instance=instance,
+        kind="deploy",
+        requested_by=None,
+        origin="runtime_repair",
+        runtime_precondition="absent",
+    )
+    _claim(admin_session, operation)
+    engine = _engine(instance.instance_name)
+    engine.status.return_value = "absent"  # preliminary check misses the race
+    engine.deploy_if_absent.return_value = None  # authoritative check: genuinely present
+    engine.inspect_running.return_value = LabHandle(
+        instance_name=instance.instance_name,
+        nodes={"client": f"clab-{instance.instance_name}-client"},
+        mgmt={"client": "172.20.20.13"},
+        kinds={"client": "linux"},
+    )
+
+    stop_calls = []
+    monkeypatch.setattr(lab_lifecycle, "stop_consoles", lambda i: stop_calls.append(i.id))
+
+    assert lab_operations.run_claimed(
+        admin_session, operation_id=operation.id, claimed_by="worker", engine=engine,
+    ) == "succeeded"
+    admin_session.refresh(instance)
+    admin_session.refresh(operation)
+    engine.deploy_if_absent.assert_called_once()  # the authoritative check DID run
+    assert instance.status == "active"
+    assert instance.error is None
+    assert instance.runtime_presence == "present"
+    # Resynced to fresh, live console data — NOT the stale placeholder.
+    assert instance.consoles["client"]["mgmt"] == "172.20.20.13"
+    assert stop_calls == [instance.id]  # stale consoles were actually torn down
+    engine.deploy.assert_not_called()
+    engine.inspect_running.assert_called_once()
+
+
+def test_conditional_deploy_fully_ambiguous_outcome_escalates_a_transient_prior_status(
+    admin_session, tenant_a, monkeypatch
+):
+    """End-to-end ``run_claimed``-level proof that Finding A's escalation
+    composes correctly through the real commit/rebind sequence: the
+    preliminary check says absent, capacity is admitted (committing the
+    transient "provisioning"/"resetting" placeholder), ``deploy_if_absent``
+    then returns ``None`` (a race — genuinely present after all), AND the
+    follow-up ``inspect_running`` ALSO returns ``None`` (fully ambiguous —
+    no positive proof either way).
+
+    The instance's TRUE pre-admission status (``initial_instance_status``,
+    captured at the very start of ``run_claimed`` before any branching) is
+    itself "provisioning" here — a legitimate starting shape for a
+    ``missing_runtime`` repair target, not only "active". Restoring it
+    verbatim on this ambiguous outcome would return the row to exactly
+    ``reconcile_stuck``'s own stuck-row sweep trigger shape once this
+    operation closes with no open operation left to protect it. The fix
+    escalates to ``status="error"`` instead."""
+    instance, _person = _seed(
+        admin_session, tenant_a.id, name="cond-deploy-fully-ambiguous",
+        status="provisioning", presence="unknown",
+    )
+    instance.error = None
+    admin_session.flush()
+    operation = lab_operations.enqueue(
+        admin_session,
+        instance=instance,
+        kind="deploy",
+        requested_by=None,
+        origin="runtime_repair",
+        runtime_precondition="absent",
+    )
+    _claim(admin_session, operation)
+    engine = _engine(instance.instance_name)
+    engine.status.return_value = "absent"  # preliminary check misses the race
+    engine.deploy_if_absent.return_value = None  # authoritative check: genuinely present
+    engine.inspect_running.return_value = None  # follow-up inspection also can't confirm
+
+    stop_calls = []
+    monkeypatch.setattr(lab_lifecycle, "stop_consoles", lambda i: stop_calls.append(i.id))
+
+    assert lab_operations.run_claimed(
+        admin_session, operation_id=operation.id, claimed_by="worker", engine=engine,
+    ) == "succeeded"
+    admin_session.refresh(instance)
+    admin_session.refresh(operation)
+    engine.deploy_if_absent.assert_called_once()
+    assert operation.state == "succeeded"
+    # Escalated, NOT restored verbatim to the transient "provisioning" value
+    # that would otherwise match reconcile_stuck's stuck-row sweep shape.
+    assert instance.status == "error"
+    assert instance.error
+    assert instance.runtime_presence == "unknown"
+    assert stop_calls == []  # never confirmed present; nothing torn down
+    engine.deploy.assert_not_called()
+
+
+def test_single_conditional_deploy_failure_does_not_escalate(admin_session, tenant_a):
+    """A lone automatic repair-deploy failure (no prior history) must revert
+    the instance to ``deploy_failure_status`` (here "active", since capacity
+    admission commits "resetting" before the engine call fails) exactly as
+    before this fix — proving Finding A's escalation only changes the
+    CUMULATIVE case, not every failure."""
+    instance, _person = _seed(
+        admin_session, tenant_a.id, name="cond-deploy-single-failure", status="active",
+    )
+    operation = lab_operations.enqueue(
+        admin_session,
+        instance=instance,
+        kind="deploy",
+        requested_by=None,
+        origin="runtime_repair",
+        runtime_precondition="absent",
+    )
+    operation.state = "claimed"
+    operation.claimed_by = "worker"
+    operation.claimed_at = datetime.now(UTC)
+    operation.heartbeat_at = datetime.now(UTC)
+    operation.attempts = 1  # matches what claim_next() would have set
+    admin_session.commit()
+
+    engine = MagicMock()
+    engine.status.return_value = "absent"
+    engine.deploy_if_absent.side_effect = RuntimeError("containerlab wedged")
+
+    outcome = lab_operations.run_claimed(
+        admin_session, operation_id=operation.id, claimed_by="worker", engine=engine
+    )
+    assert outcome == "failed"
+    admin_session.refresh(instance)
+    admin_session.refresh(operation)
+    assert operation.state == "failed"
+    assert instance.status == "active"  # reverted, not escalated
+    assert instance.error == "containerlab wedged"
+
+
+def test_repeated_automatic_repair_deploy_failures_escalate_to_manual_intervention(
+    admin_session, tenant_a
+):
+    """Mirrors ``test_five_consecutive_automatic_destroy_failures_escalate_
+    instance_to_error`` for the deploy side of the same problem: a
+    persistently wedged instance's automatic (reconciler-triggered) repair
+    deploys must stop retrying forever once cumulative attempts reach
+    ``MAX_ATTEMPTS_BY_KIND["deploy"]`` — see this file's round-9 fix adding
+    ``_automatic_repair_deploy_escalation_message``."""
+    instance, _person = _seed(
+        admin_session, tenant_a.id, name="cond-deploy-escalate", status="active",
+    )
+    engine = MagicMock()
+    engine.status.return_value = "absent"
+    engine.deploy_if_absent.side_effect = RuntimeError("containerlab wedged")
+
+    for attempt in range(1, lab_operations.MAX_ATTEMPTS_BY_KIND["deploy"] + 1):
+        operation = lab_operations.enqueue(
+            admin_session,
+            instance=instance,
+            kind="deploy",
+            requested_by=None,
+            origin="runtime_repair",
+            runtime_precondition="absent",
+        )
+        operation.state = "claimed"
+        operation.claimed_by = "worker"
+        operation.claimed_at = datetime.now(UTC)
+        operation.heartbeat_at = datetime.now(UTC)
+        operation.attempts = 1  # matches what claim_next() would have set
+        admin_session.commit()
+
+        outcome = lab_operations.run_claimed(
+            admin_session, operation_id=operation.id, claimed_by="worker", engine=engine
+        )
+        assert outcome == "failed"
+        admin_session.refresh(instance)
+        admin_session.refresh(operation)
+        assert operation.state == "failed"
+        if attempt < lab_operations.MAX_ATTEMPTS_BY_KIND["deploy"]:
+            assert instance.status == "active"  # reverted, not escalated yet
+        else:
+            assert instance.status == "error"
+            assert instance.error == (
+                "automatic repair deploy failed 3 times; manual intervention required"
+            )
+
+
+def test_conditional_deploy_escalated_settlement_does_not_reset_destroy_failure_window(
+    admin_session, tenant_a
+):
+    """A "succeeded" conditional-deploy settlement that only escalated a
+    fully-ambiguous outcome to manual verification (round 6) must not
+    silently reset the DESTROY-side automatic-escalation window (Finding B):
+    the earlier destroy failures must still count toward the destroy
+    ceiling afterward, unlike a GENUINELY successful redeploy (contrast with
+    ``test_user_initiated_deploy_survives_escalation_and_resets_failure_
+    window``, which proves a real successful redeploy DOES reset it)."""
+    instance, _person = _seed(
+        admin_session, tenant_a.id, name="cond-deploy-no-reset",
+        status="provisioning", presence="unknown",
+    )
+    instance.error = None
+    admin_session.flush()
+    destroy_engine = MagicMock()
+    destroy_engine.destroy.side_effect = RuntimeError("destroy refused")
+    prior_destroy_failures = lab_operations.MAX_ATTEMPTS_BY_KIND["destroy"] - 1
+    for _ in range(prior_destroy_failures):
+        operation = lab_operations.enqueue(
+            admin_session, instance=instance, kind="destroy", requested_by=None
+        )
+        operation.state = "claimed"
+        operation.claimed_by = "worker"
+        operation.claimed_at = datetime.now(UTC)
+        operation.heartbeat_at = datetime.now(UTC)
+        operation.attempts = 1  # matches what claim_next() would have set
+        admin_session.commit()
+        outcome = lab_operations.run_claimed(
+            admin_session,
+            operation_id=operation.id,
+            claimed_by="worker",
+            engine=destroy_engine,
+        )
+        assert outcome == "failed"
+    admin_session.refresh(instance)
+    assert instance.status == "provisioning"  # under the destroy ceiling, not escalated
+
+    # A conditional deploy on the SAME instance settles via the fully-
+    # ambiguous escalation path: preliminary check misses a race, the
+    # authoritative check also can't confirm, and the follow-up inspection
+    # can't confirm either.
+    deploy_op = lab_operations.enqueue(
+        admin_session,
+        instance=instance,
+        kind="deploy",
+        requested_by=None,
+        origin="runtime_repair",
+        runtime_precondition="absent",
+    )
+    _claim(admin_session, deploy_op)
+    engine = _engine(instance.instance_name)
+    engine.status.return_value = "absent"
+    engine.deploy_if_absent.return_value = None
+    engine.inspect_running.return_value = None
+
+    assert lab_operations.run_claimed(
+        admin_session, operation_id=deploy_op.id, claimed_by="worker", engine=engine,
+    ) == "succeeded"
+    admin_session.refresh(instance)
+    admin_session.refresh(deploy_op)
+    assert instance.status == "error"  # escalated, per round-6 fix
+    assert deploy_op.state == "succeeded"
+    assert deploy_op.last_error  # marked so it can't be mistaken for a healthy redeploy
+
+    # A subsequent destroy failure's cumulative count must still include the
+    # earlier destroy failures: the window was NOT reset by the escalated
+    # "succeeded" deploy settlement.
+    next_destroy = lab_operations.enqueue(
+        admin_session, instance=instance, kind="destroy", requested_by=None
+    )
+    next_destroy.state = "claimed"
+    next_destroy.claimed_by = "worker"
+    next_destroy.claimed_at = datetime.now(UTC)
+    next_destroy.heartbeat_at = datetime.now(UTC)
+    next_destroy.attempts = 1
+    admin_session.commit()
+    final_destroy_engine = MagicMock()
+    final_destroy_engine.destroy.side_effect = RuntimeError("destroy refused again")
+
+    outcome = lab_operations.run_claimed(
+        admin_session,
+        operation_id=next_destroy.id,
+        claimed_by="worker",
+        engine=final_destroy_engine,
+    )
+    assert outcome == "failed"
+    admin_session.refresh(instance)
+    assert instance.status == "error"
+    assert instance.error == (
+        f"automatic destroy failed {lab_operations.MAX_ATTEMPTS_BY_KIND['destroy']} "
+        "times; manual intervention required"
+    )
+
+
+def test_conditional_deploy_ambiguous_non_escalated_outcome_still_marks_operation_last_error(
+    admin_session, tenant_a, monkeypatch
+):
+    """Proves the specific gap this fix closes: the preliminary/authoritative
+    check misses (genuinely present after all, per a race), the follow-up
+    ``inspect_running`` is ALSO ambiguous (returns ``None``), but the
+    instance's TRUE prior status is "active" — NOT one of the transient
+    values ("queued"/"provisioning"/"resetting") that ``provision_if_absent``
+    escalates to ``status="error"``. "active" is deliberately never
+    escalated (it has its own safe self-healing path via
+    ``reconcile_runtime``'s next pass), so ``instance.status`` stays
+    "active" here — but the outcome is JUST AS UNCONFIRMED as the escalated
+    case. Checking ``instance.status == "error"`` alone (the pre-fix trigger)
+    missed this case entirely; the fix (``instance.runtime_presence !=
+    "present"``) must still mark the OPERATION's own ``last_error`` so
+    neither escalation function's window-reset query mistakes this for a
+    genuinely healthy redeploy."""
+    instance, _person = _seed(
+        admin_session, tenant_a.id, name="cond-deploy-ambiguous-active",
+        status="active", presence="present",
+    )
+    instance.error = None
+    admin_session.flush()
+    operation = lab_operations.enqueue(
+        admin_session,
+        instance=instance,
+        kind="deploy",
+        requested_by=None,
+        origin="runtime_repair",
+        runtime_precondition="absent",
+    )
+    _claim(admin_session, operation)
+    engine = _engine(instance.instance_name)
+    engine.status.return_value = "absent"  # preliminary check misses the race
+    engine.deploy_if_absent.return_value = None  # authoritative check: genuinely present
+    engine.inspect_running.return_value = None  # follow-up inspection also can't confirm
+
+    stop_calls = []
+    monkeypatch.setattr(lab_lifecycle, "stop_consoles", lambda i: stop_calls.append(i.id))
+
+    assert lab_operations.run_claimed(
+        admin_session, operation_id=operation.id, claimed_by="worker", engine=engine,
+    ) == "succeeded"
+    admin_session.refresh(instance)
+    admin_session.refresh(operation)
+    engine.deploy_if_absent.assert_called_once()
+    assert operation.state == "succeeded"
+    # NOT escalated: "active" is never escalated by design (its own
+    # self-healing path via reconcile_runtime's next pass handles it) — this
+    # is the case the pre-fix trigger missed entirely.
+    assert instance.status == "active"
+    assert instance.runtime_presence == "unknown"
+    assert stop_calls == []  # never confirmed present; nothing torn down
+    engine.deploy.assert_not_called()
+    # The actual property this fix proves: last_error is set even though
+    # status never became "error".
+    assert operation.last_error
+
+
+def test_conditional_deploy_ambiguous_non_escalated_settlement_does_not_reset_repair_deploy_failure_window(
+    admin_session, tenant_a
+):
+    """End-to-end proof of the consequence: a genuine repair-deploy failure,
+    then this exact ambiguous-but-NOT-escalated no-op (instance status stays
+    "active" throughout, never touches "error"), then another genuine
+    repair-deploy failure — the cumulative escalation count used by
+    ``_automatic_repair_deploy_escalation_message`` must still include BOTH
+    genuine failures; the ambiguous no-op in between must not reset the
+    window. Mirrors ``test_conditional_deploy_escalated_settlement_does_not_
+    reset_destroy_failure_window``'s structure, but for the repair-deploy
+    escalation function and for this specific non-escalated-but-ambiguous
+    case (rather than the escalated-to-error case that test already
+    covers)."""
+    instance, _person = _seed(
+        admin_session, tenant_a.id, name="cond-deploy-window-no-reset",
+        status="active", presence="present",
+    )
+    instance.error = None
+    admin_session.flush()
+
+    # Genuine failure #1: burns 2 attempts on one row (mirrors a
+    # lease-expiry/restart-reclaim burning multiple attempts on a single
+    # operation — see _automatic_repair_deploy_escalation_message's own
+    # docstring on why attempts, not row count, are summed).
+    first_failure = lab_operations.enqueue(
+        admin_session,
+        instance=instance,
+        kind="deploy",
+        requested_by=None,
+        origin="runtime_repair",
+        runtime_precondition="absent",
+    )
+    first_failure.state = "claimed"
+    first_failure.claimed_by = "worker"
+    first_failure.claimed_at = datetime.now(UTC)
+    first_failure.heartbeat_at = datetime.now(UTC)
+    first_failure.attempts = 2
+    admin_session.commit()
+
+    failing_engine = MagicMock()
+    failing_engine.status.return_value = "absent"
+    failing_engine.deploy_if_absent.side_effect = RuntimeError("containerlab wedged")
+    outcome = lab_operations.run_claimed(
+        admin_session, operation_id=first_failure.id, claimed_by="worker", engine=failing_engine,
+    )
+    assert outcome == "failed"
+    admin_session.refresh(instance)
+    assert instance.status == "active"  # under the deploy ceiling, not escalated
+
+    # The ambiguous, non-escalated no-op: preliminary/authoritative checks
+    # miss, follow-up inspection also can't confirm, TRUE prior status
+    # ("active") is not one of the transient values, so it settles
+    # "succeeded" WITHOUT escalating status to "error" — exactly the
+    # previously-missed case.
+    noop_op = lab_operations.enqueue(
+        admin_session,
+        instance=instance,
+        kind="deploy",
+        requested_by=None,
+        origin="runtime_repair",
+        runtime_precondition="absent",
+    )
+    _claim(admin_session, noop_op)
+    noop_engine = _engine(instance.instance_name)
+    noop_engine.status.return_value = "absent"
+    noop_engine.deploy_if_absent.return_value = None
+    noop_engine.inspect_running.return_value = None
+    assert lab_operations.run_claimed(
+        admin_session, operation_id=noop_op.id, claimed_by="worker", engine=noop_engine,
+    ) == "succeeded"
+    admin_session.refresh(instance)
+    admin_session.refresh(noop_op)
+    assert instance.status == "active"  # NOT escalated — the case this fix covers
+    assert noop_op.state == "succeeded"
+    assert noop_op.last_error  # marked so it can't be mistaken for a healthy redeploy
+
+    # Genuine failure #2: with the ceiling at 3 and failure #1 having burned
+    # 2 attempts, this single-attempt failure's cumulative count (2 + 1 = 3)
+    # reaches the ceiling and escalates — but ONLY if failure #1's attempts
+    # still count, i.e. only if the no-op above did NOT reset the window.
+    # Before this fix, the no-op would have settled with last_error=None,
+    # which _automatic_repair_deploy_escalation_message's own
+    # last_deploy_success_at query treats as proof of a genuinely healthy
+    # redeploy, silently excluding failure #1 from the count and leaving
+    # this second failure short of the ceiling (cumulative 1 < 3, not
+    # escalated).
+    second_failure = lab_operations.enqueue(
+        admin_session,
+        instance=instance,
+        kind="deploy",
+        requested_by=None,
+        origin="runtime_repair",
+        runtime_precondition="absent",
+    )
+    second_failure.state = "claimed"
+    second_failure.claimed_by = "worker"
+    second_failure.claimed_at = datetime.now(UTC)
+    second_failure.heartbeat_at = datetime.now(UTC)
+    second_failure.attempts = 1
+    admin_session.commit()
+
+    final_engine = MagicMock()
+    final_engine.status.return_value = "absent"
+    final_engine.deploy_if_absent.side_effect = RuntimeError("containerlab wedged again")
+    outcome = lab_operations.run_claimed(
+        admin_session, operation_id=second_failure.id, claimed_by="worker", engine=final_engine,
+    )
+    assert outcome == "failed"
+    admin_session.refresh(instance)
+    assert instance.status == "error"
+    assert instance.error == (
+        f"automatic repair deploy failed {lab_operations.MAX_ATTEMPTS_BY_KIND['deploy']} "
+        "times; manual intervention required"
+    )
+
+
+def test_conditional_destroy_precondition_holds_destroys_and_stops_consoles_after(
+    admin_session, tenant_a, monkeypatch
+):
+    instance, _person = _seed(
+        admin_session, tenant_a.id, name="cond-destroy-ok", status="reaped", presence="present",
+    )
+    instance.consoles = {"client": {"kind": "linux"}}
+    admin_session.flush()
+    operation = lab_operations.enqueue(
+        admin_session,
+        instance=instance,
+        kind="destroy",
+        requested_by=None,
+        origin="runtime_cleanup",
+        runtime_precondition="present",
+    )
+    _claim(admin_session, operation)
+    engine = _engine(instance.instance_name)
+    order = []
+    engine.destroy_if_present.side_effect = lambda name: order.append("destroy_if_present") or True
+    monkeypatch.setattr(lab_lifecycle, "stop_consoles", lambda i: order.append("stop_consoles"))
+
+    assert lab_operations.run_claimed(
+        admin_session, operation_id=operation.id, claimed_by="worker", engine=engine,
+    ) == "succeeded"
+    admin_session.refresh(instance)
+    assert instance.status == "reaped"
+    assert instance.runtime_presence == "absent"
+    assert order == ["destroy_if_present", "stop_consoles"]
+    engine.destroy.assert_not_called()
+
+
+def test_conditional_destroy_precondition_mismatch_settles_noop(
+    admin_session, tenant_a, monkeypatch
+):
+    instance, _person = _seed(
+        admin_session, tenant_a.id, name="cond-destroy-noop", status="reaped", presence="unknown",
+    )
+    instance.error = "prior error text"
+    instance.consoles = {"client": {"kind": "linux"}}
+    admin_session.flush()
+    operation = lab_operations.enqueue(
+        admin_session,
+        instance=instance,
+        kind="destroy",
+        requested_by=None,
+        origin="runtime_cleanup",
+        runtime_precondition="present",
+    )
+    _claim(admin_session, operation)
+    engine = _engine(instance.instance_name)
+    engine.destroy_if_present.return_value = False  # precondition mismatch: already absent
+    stop_calls = []
+    monkeypatch.setattr(lab_lifecycle, "stop_consoles", lambda i: stop_calls.append(i.id))
+
+    assert lab_operations.run_claimed(
+        admin_session, operation_id=operation.id, claimed_by="worker", engine=engine,
+    ) == "succeeded"
+    admin_session.refresh(instance)
+    assert instance.status == "reaped"
+    assert instance.error == "prior error text"
+    assert instance.consoles == {"client": {"kind": "linux"}}
+    assert instance.runtime_presence == "absent"
+    assert stop_calls == []
+    engine.destroy.assert_not_called()
+
+
+def test_conditional_deploy_host_lock_unavailable_restores_initial_state_without_charging_attempt(
+    admin_session, tenant_a
+):
+    instance, _person = _seed(
+        admin_session, tenant_a.id, name="cond-deploy-lock", status="active", presence="unknown",
+    )
+    instance.error = None
+    admin_session.flush()
+    operation = lab_operations.enqueue(
+        admin_session,
+        instance=instance,
+        kind="deploy",
+        requested_by=None,
+        origin="runtime_repair",
+        runtime_precondition="absent",
+    )
+    _claim(admin_session, operation)
+    attempts_at_claim = operation.attempts
+    engine = _engine(instance.instance_name)
+    engine.status.side_effect = host_lock.HostLockUnavailable("host lock held")
+
+    assert lab_operations.run_claimed(
+        admin_session, operation_id=operation.id, claimed_by="worker", engine=engine,
+    ) == "deferred"
+    admin_session.refresh(instance)
+    admin_session.refresh(operation)
+    assert instance.status == "active"
+    assert instance.error is None
+    assert instance.runtime_presence == "unknown"
+    assert operation.state == "queued"
+    assert operation.claimed_by is None
+    # Refunded, not charged an extra attempt for lock contention.
+    assert operation.attempts == max(attempts_at_claim - 1, 0)
+
+
+def test_conditional_deploy_host_lock_unavailable_during_present_resync_restores_initial_state_without_charging_attempt(
+    admin_session, tenant_a, monkeypatch
+):
+    """The preliminary check finds the runtime present (no lock error there),
+    but the follow-up ``resync_present_preliminary`` ->
+    ``_rebuild_consoles_from_live_inspection`` -> ``engine.inspect_running()``
+    call raises ``HostLockUnavailable`` instead. This is the second of three
+    ``HostLockUnavailable`` raise points in the conditional-deploy branch, and
+    exercises the composed correctness claim in ``run_claimed``'s own
+    ``HostLockUnavailable`` handler: because ``_rebuild_consoles_from_live_
+    inspection`` now calls ``inspect_running()`` before ``stop_consoles()``,
+    nothing has been mutated yet, so restoring the instance's exact
+    pre-operation state here is safe. ``stop_consoles`` must never be called.
+    """
+    instance, _person = _seed(
+        admin_session, tenant_a.id, name="cond-deploy-lock-present", status="active", presence="unknown",
+    )
+    instance.error = None
+    admin_session.flush()
+    operation = lab_operations.enqueue(
+        admin_session,
+        instance=instance,
+        kind="deploy",
+        requested_by=None,
+        origin="runtime_repair",
+        runtime_precondition="absent",
+    )
+    _claim(admin_session, operation)
+    attempts_at_claim = operation.attempts
+    engine = _engine(instance.instance_name)
+    engine.status.return_value = "running"
+    engine.inspect_running.side_effect = host_lock.HostLockUnavailable("host lock held")
+    stop_calls = []
+    monkeypatch.setattr(lab_lifecycle, "stop_consoles", lambda i: stop_calls.append(i.id))
+
+    assert lab_operations.run_claimed(
+        admin_session, operation_id=operation.id, claimed_by="worker", engine=engine,
+    ) == "deferred"
+    admin_session.refresh(instance)
+    admin_session.refresh(operation)
+    assert instance.status == "active"
+    assert instance.error is None
+    assert instance.runtime_presence == "unknown"
+    assert operation.state == "queued"
+    assert operation.claimed_by is None
+    # Refunded, not charged an extra attempt for lock contention.
+    assert operation.attempts == max(attempts_at_claim - 1, 0)
+    # Proves the ordering-fix composition claim: no console teardown occurred.
+    assert stop_calls == []
+
+
+def test_conditional_deploy_host_lock_unavailable_during_deploy_if_absent_restores_initial_state_without_charging_attempt(
+    admin_session, tenant_a
+):
+    """The preliminary check finds the runtime absent, capacity is admitted,
+    but ``provision_if_absent``'s own ``engine.deploy_if_absent()`` call
+    raises ``HostLockUnavailable``. This is the third of three
+    ``HostLockUnavailable`` raise points in the conditional-deploy branch:
+    ``deploy_if_absent`` performs the precondition check and the mutation
+    atomically inside one host-lock acquisition, so a raise from that single
+    acquisition proves nothing was mutated, and restoring the instance's
+    exact pre-operation state (including the capacity-admission placeholder
+    status/presence) is safe.
+    """
+    instance, _person = _seed(
+        admin_session, tenant_a.id, name="cond-deploy-lock-absent", status="active", presence="unknown",
+    )
+    instance.error = None
+    admin_session.flush()
+    operation = lab_operations.enqueue(
+        admin_session,
+        instance=instance,
+        kind="deploy",
+        requested_by=None,
+        origin="runtime_repair",
+        runtime_precondition="absent",
+    )
+    _claim(admin_session, operation)
+    attempts_at_claim = operation.attempts
+    engine = _engine(instance.instance_name)
+    engine.status.return_value = "absent"
+    engine.deploy_if_absent.side_effect = host_lock.HostLockUnavailable("host lock held")
+
+    assert lab_operations.run_claimed(
+        admin_session, operation_id=operation.id, claimed_by="worker", engine=engine,
+    ) == "deferred"
+    admin_session.refresh(instance)
+    admin_session.refresh(operation)
+    assert instance.status == "active"
+    assert instance.error is None
+    assert instance.runtime_presence == "unknown"
+    assert operation.state == "queued"
+    assert operation.claimed_by is None
+    # Refunded, not charged an extra attempt for lock contention.
+    assert operation.attempts == max(attempts_at_claim - 1, 0)
+
+
+def test_conditional_destroy_host_lock_unavailable_restores_initial_state_without_charging_attempt(
+    admin_session, tenant_a
+):
+    instance, _person = _seed(
+        admin_session, tenant_a.id, name="cond-destroy-lock", status="reaped", presence="present",
+    )
+    admin_session.flush()
+    operation = lab_operations.enqueue(
+        admin_session,
+        instance=instance,
+        kind="destroy",
+        requested_by=None,
+        origin="runtime_cleanup",
+        runtime_precondition="present",
+    )
+    _claim(admin_session, operation)
+    attempts_at_claim = operation.attempts
+    engine = _engine(instance.instance_name)
+    engine.destroy_if_present.side_effect = host_lock.HostLockUnavailable("host lock held")
+
+    assert lab_operations.run_claimed(
+        admin_session, operation_id=operation.id, claimed_by="worker", engine=engine,
+    ) == "deferred"
+    admin_session.refresh(instance)
+    admin_session.refresh(operation)
+    assert instance.status == "reaped"
+    assert instance.runtime_presence == "present"
+    assert operation.state == "queued"
+    assert operation.attempts == max(attempts_at_claim - 1, 0)
