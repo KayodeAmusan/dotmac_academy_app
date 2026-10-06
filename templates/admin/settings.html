@@ -1,9 +1,9 @@
 {% extends "base.html" %}
 {% block title %}Settings — {{ branding_name | default("Dotmac Academy") }}{% endblock %}
 {% block content %}
-<p class="font-sans text-sm font-semibold uppercase tracking-[0.16em] text-brand-600">Administration</p>
-<h1 class="mt-1.5 text-3xl tracking-tight">Platform settings</h1>
-<p class="mt-2 text-ink-soft">Branding, outbound email, and lab capacity. These override environment defaults.</p>
+<p class="page-eyebrow">Administration</p>
+<h1 class="page-title">Platform settings</h1>
+<p class="page-intro">Branding, outbound email, and lab capacity. These override environment defaults.</p>
 
 <form hx-post="/admin/settings" hx-target="#settings-save-result" hx-swap="innerHTML" class="mt-10 space-y-6">
   <section class="card p-6">

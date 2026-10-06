@@ -2,11 +2,11 @@
 {% block content_width %}max-w-5xl{% endblock %}
 {% block title %}Audit log — {{ branding_name | default("Technical Academy") }}{% endblock %}
 {% block content %}
-<p class="font-sans text-sm font-semibold uppercase tracking-[0.16em] text-brand-600">Administration</p>
-<h1 class="mt-1.5 text-3xl tracking-tight">Audit log</h1>
-<p class="mt-2 text-ink-soft">A record of actions taken by administrators and the system.</p>
+<p class="page-eyebrow">Administration</p>
+<h1 class="page-title">Audit log</h1>
+<p class="page-intro">A record of actions taken by administrators and the system.</p>
 
-<form method="get" action="/admin/audit" class="mt-8 flex flex-wrap items-end gap-3">
+<form method="get" action="/admin/audit" class="filter-bar mt-8 flex flex-wrap items-end gap-3">
   <div>
     <label for="action" class="mb-1 block text-sm font-semibold text-ink">Action</label>
     <input id="action" name="action" type="text" value="{{ action_filter }}"
