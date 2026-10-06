@@ -2,9 +2,9 @@
 {% block content_width %}max-w-5xl{% endblock %}
 {% block title %}{{ cohort.name }} — Dashboard{% endblock %}
 {% block content %}
-<p class="font-sans text-sm font-semibold uppercase tracking-[0.16em] text-brand-600">Cohort dashboard</p>
-<h1 class="mt-1.5 text-3xl tracking-tight">{{ cohort.name }}</h1>
-<p class="mt-2 text-ink-soft">Completion and at-risk learners across this cohort's offered courses.</p>
+<p class="page-eyebrow">Cohort dashboard</p>
+<h1 class="page-title">{{ cohort.name }}</h1>
+<p class="page-intro">Completion and at-risk learners across this cohort's offered courses.</p>
 
 {% if rows %}
 <div class="card table-frame mt-10" role="region" aria-label="Cohort dashboard table; scroll horizontally to see all columns" tabindex="0">

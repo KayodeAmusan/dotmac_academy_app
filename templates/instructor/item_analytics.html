@@ -2,9 +2,9 @@
 {% block content_width %}max-w-5xl{% endblock %}
 {% block title %}Item analysis — {{ activity.title }}{% endblock %}
 {% block content %}
-<p class="font-sans text-sm font-semibold uppercase tracking-[0.16em] text-brand-600">Item analysis</p>
-<h1 class="mt-1.5 text-3xl tracking-tight">{{ activity.title }}</h1>
-<p class="mt-2 text-ink-soft">Per-question difficulty (p-value = fraction answering correctly; lower is harder).</p>
+<p class="page-eyebrow">Item analysis</p>
+<h1 class="page-title">{{ activity.title }}</h1>
+<p class="page-intro">Per-question difficulty (p-value = fraction answering correctly; lower is harder).</p>
 
 {% if items %}
 <div class="card table-frame mt-10" role="region" aria-label="Question analytics table; scroll horizontally to see all columns" tabindex="0">
