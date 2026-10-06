@@ -20,7 +20,7 @@
       <span class="flex items-center gap-4">
         <a class="text-sm font-semibold text-brand-700 hover:text-brand-800"
            href="/instructor/reports/cohort/{{ c.id }}/analytics">Analytics</a>
-        <a class="group inline-flex items-center gap-1.5 text-sm font-semibold text-brand-700 hover:text-brand-800"
+        <a class="group inline-flex min-h-11 items-center gap-1.5 text-sm font-semibold text-brand-700 hover:text-brand-800"
            href="/instructor/reports/cohort/{{ c.id }}">
           View matrix
           <span class="transition-transform group-hover:translate-x-0.5" aria-hidden="true">&rarr;</span>
@@ -40,8 +40,8 @@
   <table class="data-table">
     <thead>
       <tr class="border-b border-sand-200 text-left text-xs font-semibold uppercase tracking-wide text-ink-soft">
-        <th class="p-3">Cohort</th><th class="p-3">Learners</th><th class="p-3">Active (7d)</th>
-        <th class="p-3">Completed</th><th class="p-3">Completion</th>
+        <th scope="col" class="p-3">Cohort</th><th scope="col" class="p-3">Learners</th><th scope="col" class="p-3">Active (7d)</th>
+        <th scope="col" class="p-3">Completed</th><th scope="col" class="p-3">Completion</th>
       </tr>
     </thead>
     <tbody class="divide-y divide-sand-200">

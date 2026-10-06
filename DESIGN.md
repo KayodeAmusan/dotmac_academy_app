@@ -84,7 +84,7 @@ components:
     typography: "{typography.body}"
     rounded: "{rounded.control}"
     padding: "8px 16px"
-    height: "40px"
+    height: "44px"
   button-primary-hover:
     backgroundColor: "{colors.forest-800}"
     textColor: "{colors.paper-white}"
@@ -93,7 +93,7 @@ components:
     textColor: "{colors.ink}"
     rounded: "{rounded.control}"
     padding: "8px 16px"
-    height: "40px"
+    height: "44px"
   surface-card:
     backgroundColor: "{colors.paper-white}"
     textColor: "{colors.ink}"
@@ -183,10 +183,10 @@ Controls, tabs, nav rows, fields, and action rows use 4px corners. Cards, table 
 
 ### Buttons
 
-- **Primary:** 40px minimum height, 4px radius, 8px × 16px padding, forest-700 on white; hover forest-800 on precise pointers.
+- **Primary:** 44px minimum height, 4px radius, 8px × 16px padding, forest-700 on white; hover forest-800 on precise pointers.
 - **Ghost:** white with neutral-400 border and ink; hover moves border to forest-400 and text to forest-700.
 - **Pressed / disabled:** press scales to `0.98`; disabled uses `cursor-not-allowed`, 50% opacity, and no transform.
-- **Focus:** 2px forest-600 outline with 3px offset. Icon-only controls remain at least 40×40px.
+- **Focus:** 2px forest-600 outline with 3px offset. Icon-only controls remain at least 44×44px.
 
 ### Badges and Chips
 
@@ -194,7 +194,7 @@ Status badges are compact pills: `0.75rem`, weight 650, `0.18rem 0.6rem` padding
 
 ### Cards and Fields
 
-Cards are white, 8px, one warm-line border, and the low card shadow. Inputs/selects/textareas are at least 40px high, white, 4px, with a 1px default border. Focus changes the border to forest-500 and adds a 3px translucent forest ring. Placeholder text is neutral-600 at full opacity.
+Cards are white, 8px, one warm-line border, and the low card shadow. Inputs/selects/textareas are at least 44px high, white, 4px, with a 1px default border. Focus changes the border to forest-500 and adds a 3px translucent forest ring. Placeholder text is neutral-600 at full opacity.
 
 ### Navigation
 

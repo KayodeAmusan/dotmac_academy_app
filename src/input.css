@@ -158,7 +158,11 @@
    legacy brand/sand/ink/clay class names are compatibility aliases only. */
 
 @layer base {
-  html { -webkit-text-size-adjust: 100%; }
+  html {
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+    scroll-padding-top: calc(var(--academy-shell-offset, 4rem) + 1rem);
+  }
 
   body {
     @apply bg-sand-100 text-ink font-sans;
@@ -177,6 +181,11 @@
 
   a { @apply text-brand-700; }
 
+  :is(a, button, summary, [role="button"], [tabindex]:not([tabindex="-1"])):focus-visible {
+    outline: 2px solid var(--dmui-focus-ring-color);
+    outline-offset: 3px;
+  }
+
   /* dotmac-ui owns :focus-visible; retain mouse-focus suppression locally. */
   *:focus:not(:focus-visible) { outline: none; }
 
@@ -187,6 +196,13 @@
     border: 1px solid var(--dmui-border-default);
     border-radius: 0.6rem;
   }
+  :is(input, select, textarea):not([type="hidden"]) { min-height: 2.75rem; }
+  :is(button, input, select, textarea, summary, a) { touch-action: manipulation; }
+  :is(button, [role="button"]) { min-height: 2.75rem; }
+  button[aria-label], [role="button"][aria-label] { min-width: 2.75rem; }
+  [aria-busy="true"] { cursor: progress; }
+  label:has(> input[type="checkbox"]),
+  label:has(> input[type="radio"]) { min-height: 2.75rem; }
   input::placeholder, textarea::placeholder { color: var(--dmui-text-secondary); opacity: 0.7; }
   input:focus, select:focus, textarea:focus {
     outline: none;
@@ -203,6 +219,11 @@
 }
 
 @layer components {
+  .skip-link {
+    @apply fixed left-4 top-4 z-[100] -translate-y-24 rounded bg-brand-800 px-4 py-3 font-semibold text-white shadow-lift;
+  }
+  .skip-link:focus { transform: translateY(0); }
+
   /* Buttons — the portal's primary action face. */
   .btn {
     @apply inline-flex items-center justify-center gap-2 rounded-xl px-5 py-2.5
@@ -286,7 +307,7 @@
 
   /* App shell — role-aware area tabs + contextual sidebar + user menu. */
   .shell-tab {
-    @apply whitespace-nowrap rounded-lg px-3 py-1.5 text-sm font-medium text-ink-soft
+    @apply inline-flex min-h-11 items-center whitespace-nowrap rounded-lg px-3 py-1.5 text-sm font-medium text-ink-soft
            transition-colors hover:bg-sand-200 hover:text-brand-700;
   }
   .shell-tab-active {
@@ -326,6 +347,7 @@
 
   /* User menu disclosure (details/summary) — strip the native marker. */
   .shell-usermenu > summary {
+    min-height: 2.75rem;
     cursor: pointer;
     list-style: none;
     -webkit-tap-highlight-color: transparent;
@@ -335,6 +357,7 @@
 
   /* Native <details> disclosure (dashboard course sections) — no JS, keyboard-accessible. */
   .disclosure > summary {
+    min-height: 2.75rem;
     cursor: pointer;
     list-style: none;
     -webkit-tap-highlight-color: transparent;
@@ -366,10 +389,10 @@
   .coursework-article { @apply rounded-2xl border border-sand-300 bg-sand-50 px-5 py-6 shadow-card sm:px-8 sm:py-8; max-width: none; }
   .coursework-actions { @apply flex flex-wrap items-center justify-between gap-3 border-t border-sand-300 pt-6; }
   .coursework-chapter-group { @apply min-w-0; }
-  .coursework-chapter-link { @apply flex items-start gap-2 rounded-lg border-l-2 border-transparent px-3 py-2 text-sm font-medium text-ink-soft transition-colors hover:bg-sand-200 hover:text-brand-700; }
+  .coursework-chapter-link { @apply flex min-h-11 items-start gap-2 rounded-lg border-l-2 border-transparent px-3 py-2 text-sm font-medium text-ink-soft transition-colors hover:bg-sand-200 hover:text-brand-700; }
   .coursework-chapter-link-active { @apply border-brand-600 bg-brand-50 text-brand-800; }
   .coursework-subtopics { @apply ml-3 mt-1 grid gap-0.5 border-l border-sand-300 pl-3; }
-  .coursework-subtopic-link { @apply flex items-start gap-2 rounded-md px-2 py-1 text-xs font-medium leading-5 text-ink-soft transition-colors hover:bg-sand-200 hover:text-brand-700; }
+  .coursework-subtopic-link { @apply flex min-h-11 items-center gap-2 rounded-md px-2 py-1 text-xs font-medium leading-5 text-ink-soft transition-colors hover:bg-sand-200 hover:text-brand-700; }
   .coursework-subtopic-title { @apply min-w-0 flex-1 break-words; }
   .coursework-subtopic-check { @apply hidden shrink-0 text-brand-700; }
   .coursework-subtopic-link-current { @apply text-ink; }
@@ -585,10 +608,10 @@ body { background: #f8faf4; font-family: var(--dmui-font-body); }
 h1, h2, h3, h4 { font-family: var(--dmui-font-display); font-optical-sizing: auto; letter-spacing: -0.025em; }
 h1 { font-weight: 700; }
 h2, h3 { font-weight: 600; }
-input, select, textarea { min-height: 2.5rem; border-radius: 0.25rem; background: #fff; }
+input, select, textarea { min-height: 2.75rem; border-radius: 0.25rem; background: #fff; }
 
 .btn, .btn-primary, .btn-ghost {
-  min-height: 2.5rem;
+  min-height: 2.75rem;
   border-radius: 0.25rem;
   padding: 0.5rem 1rem;
   box-shadow: none;
@@ -617,7 +640,7 @@ input, select, textarea { min-height: 2.5rem; border-radius: 0.25rem; background
   gap: 0 0.5rem;
   align-items: center;
 }
-.shell-menu-button { display: grid; width: 2.5rem; height: 2.5rem; place-items: center; border-radius: 0.25rem; color: #404942; }
+.shell-menu-button { display: grid; width: 2.75rem; height: 2.75rem; place-items: center; border-radius: 0.25rem; color: #404942; }
 .shell-menu-button svg { width: 1.25rem; height: 1.25rem; }
 .shell-brand { grid-column: 2; grid-row: 1; }
 .shell-area-nav { grid-column: 1 / 5; grid-row: 2; align-self: center; }
@@ -626,7 +649,7 @@ input, select, textarea { min-height: 2.5rem; border-radius: 0.25rem; background
 .shell-search-button { position: absolute; right: 0; }
 .shell-notifications { grid-column: 3; grid-row: 1; }
 .shell-account { grid-column: 4; grid-row: 1; }
-.shell-tab { border-radius: 0.25rem; padding: 0.45rem 0.8rem; color: #404942; }
+.shell-tab { min-height: 2.75rem; border-radius: 0.25rem; padding: 0.45rem 0.8rem; color: #404942; }
 .shell-tab-active { background: #084728; color: #fff; }
 .shell-layout { min-height: calc(100vh - var(--academy-shell-offset)); }
 .shell-sidebar {
@@ -657,7 +680,7 @@ input, select, textarea { min-height: 2.5rem; border-radius: 0.25rem; background
 .section-title { font-size: 1.125rem; line-height: 1.35; }
 .metric-card { position: relative; overflow: hidden; }
 .action-list > * + * { border-top: 1px solid #e2e5dc; }
-.action-row { border-radius: 0.25rem; }
+.action-row { min-height: 2.75rem; border-radius: 0.25rem; }
 .status-badge { display: inline-flex; align-items: center; border-radius: 9999px; padding: 0.18rem 0.6rem; font-size: 0.75rem; font-weight: 650; }
 
 @media (hover: hover) and (pointer: fine) {
@@ -712,13 +735,13 @@ input::placeholder, textarea::placeholder { color: #6b756d; opacity: 1; }
 .table-pagination-controls { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.875rem; }
 .rows-per-page { display: flex; align-items: center; gap: 0.5rem; white-space: nowrap; }
 .rows-per-page label { color: #6b756d; font-weight: 600; }
-.rows-per-page select { min-height: 2rem; border: 1px solid #c0c9bf; padding: 0.2rem 1.8rem 0.2rem 0.55rem; font-size: 0.8125rem; }
+.rows-per-page select { min-height: 2.75rem; border: 1px solid #c0c9bf; padding: 0.35rem 1.8rem 0.35rem 0.65rem; font-size: 0.8125rem; }
 .pagination-pages { display: flex; align-items: center; gap: 0.25rem; }
-.pagination-button { display: inline-flex; min-width: 2rem; height: 2rem; align-items: center; justify-content: center; border: 1px solid transparent; border-radius: 0.25rem; padding: 0 0.55rem; color: #404942; font-weight: 650; text-decoration: none; }
+.pagination-button { display: inline-flex; min-width: 2.75rem; min-height: 2.75rem; align-items: center; justify-content: center; border: 1px solid transparent; border-radius: 0.25rem; padding: 0.35rem 0.7rem; color: #404942; font-weight: 650; text-decoration: none; }
 .pagination-button svg { width: 1rem; height: 1rem; }
 .pagination-direction { gap: 0.25rem; border-color: #e2e5dc; background: #fff; }
 .pagination-button.is-current { background: #084728; color: #fff; }
-.pagination-button.is-disabled { color: #919b91; cursor: not-allowed; }
+.pagination-button.is-disabled { color: #6b756d; cursor: not-allowed; }
 .pagination-ellipsis { min-width: 1.5rem; text-align: center; color: #6b756d; }
 .status-dot { display: inline-block; width: 0.42rem; height: 0.42rem; border-radius: 9999px; background: currentColor; }
 
@@ -739,3 +762,36 @@ input::placeholder, textarea::placeholder { color: #6b756d; opacity: 1; }
   .table-pagination-controls { align-items: flex-start; }
   .pagination-pages { width: 100%; justify-content: space-between; }
 }
+
+/* Apple HIG web adaptation: resilient focus, contrast and motion preferences. */
+.shell-brand,
+.shell-usermenu nav :is(a, button) { min-height: 2.75rem; }
+.shell-brand { min-width: 2.75rem; }
+:target { scroll-margin-top: calc(var(--academy-shell-offset) + 1rem); }
+
+@media (prefers-contrast: more) {
+  :root { --dmui-border-default: #6b756d; --dmui-border-strong: #404942; }
+  .data-table th,
+  .page-intro,
+  .cell-secondary { color: #2b312c; }
+}
+
+@media (forced-colors: active) {
+  :is(a, button, input, select, textarea, summary):focus-visible {
+    outline: 3px solid Highlight;
+  }
+  .status-dot,
+  .shell-navlink-active::before { forced-color-adjust: auto; }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .shell-sidebar-scrim,
+  .lightbox { background: #001d0f; }
+}
+.btn-secondary {
+  display: inline-flex;
+  min-height: 2.75rem;
+  align-items: center;
+  justify-content: center;
+}
+.code-copy:focus-visible { opacity: 1; outline-color: #fff; }

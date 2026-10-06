@@ -3,7 +3,9 @@
 <h1 class="page-title">Search</h1>
 
 <form method="get" action="/search" class="mt-6 flex gap-2">
+  <label class="sr-only" for="academy-search-results">Search courses and chapters</label>
   <input
+    id="academy-search-results"
     type="search"
     name="q"
     value="{{ q | e }}"
