@@ -22,7 +22,7 @@
 
       <div id="apply-result">
         <form hx-post="/apply" hx-target="#apply-result" hx-swap="outerHTML" class="mt-6 space-y-5">
-          <div class="grid grid-cols-2 gap-4">
+          <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <div>
               <label for="first_name" class="mb-1.5 block text-sm font-semibold text-ink">First name</label>
               <input id="first_name" name="first_name" type="text" required maxlength="80"
@@ -60,7 +60,7 @@
             <p class="mt-0.5 text-xs text-ink-soft">We use this to assess your application. Nothing here needs prior experience.</p>
           </div>
 
-          <div class="grid grid-cols-2 gap-4">
+          <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <div>
               <label for="date_of_birth" class="mb-1.5 block text-sm font-semibold text-ink">Date of birth</label>
               <input id="date_of_birth" name="date_of_birth" type="date" required
@@ -78,7 +78,7 @@
                    class="w-full px-3.5 py-2.5 text-[0.95rem]">
           </div>
 
-          <div class="grid grid-cols-2 gap-4">
+          <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <div>
               <label for="highest_qualification" class="mb-1.5 block text-sm font-semibold text-ink">Highest qualification</label>
               <select id="highest_qualification" name="highest_qualification" required
@@ -101,7 +101,7 @@
             </div>
           </div>
 
-          <div class="grid grid-cols-2 gap-4">
+          <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <div>
               <label for="years_experience" class="mb-1.5 block text-sm font-semibold text-ink">Years of work experience</label>
               <input id="years_experience" name="years_experience" type="number" min="0" max="60" required
@@ -114,7 +114,7 @@
             </div>
           </div>
 
-          <div class="grid grid-cols-3 gap-4">
+          <div class="grid grid-cols-1 gap-4 sm:grid-cols-3">
             <div>
               <label for="has_device" class="mb-1.5 block text-sm font-semibold text-ink">Laptop or smartphone?</label>
               <select id="has_device" name="has_device" required class="w-full px-3.5 py-2.5 text-[0.95rem]">
@@ -141,7 +141,7 @@
             </div>
           </div>
 
-          <div class="grid grid-cols-2 gap-4">
+          <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <div>
               <label for="available_from" class="mb-1.5 block text-sm font-semibold text-ink">Available from <span class="font-normal text-ink-soft">(optional)</span></label>
               <input id="available_from" name="available_from" type="date"

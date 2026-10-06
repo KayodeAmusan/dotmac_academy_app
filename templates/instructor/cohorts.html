@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% block content_width %}max-w-5xl{% endblock %}
 {% block title %}Cohorts — Dotmac Academy{% endblock %}
 {% block content %}
 <p class="font-sans text-sm font-semibold uppercase tracking-[0.16em] text-brand-600">Instructor</p>
@@ -191,8 +192,8 @@
         </span>
       </summary>
       {% if row.roster %}
-      <div class="mt-3 overflow-hidden rounded-lg border border-sand-200">
-        <table class="min-w-full divide-y divide-sand-200 text-sm">
+      <div class="table-frame mt-3 rounded-lg border border-sand-200" role="region" aria-label="Cohort roster table; scroll horizontally to see all columns" tabindex="0">
+        <table class="data-table min-w-full divide-y divide-sand-200 text-sm">
           <thead class="bg-sand-100 text-left text-xs font-semibold uppercase tracking-wide text-ink-soft">
             <tr>
               <th class="px-3 py-2">Student</th>

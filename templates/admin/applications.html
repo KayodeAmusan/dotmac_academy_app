@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% block title %}Applications - {{ branding_name | default("Dotmac Academy") }}{% endblock %}
+{% block content_width %}max-w-5xl{% endblock %}
 {% block content %}
 <p class="font-sans text-sm font-semibold uppercase tracking-[0.16em] text-brand-600">Admin</p>
 <h1 class="mt-1.5 text-3xl tracking-tight">Applications</h1>
@@ -26,7 +27,7 @@
         <input id="application-from" name="applied_from" type="date" value="{{ applied_from }}" class="min-w-0 px-3.5 py-2.5 text-[0.95rem]">
         <label for="application-to" class="sr-only">Applied to</label>
         <input id="application-to" name="applied_to" type="date" value="{{ applied_to }}" class="min-w-0 px-3.5 py-2.5 text-[0.95rem]">
-        <div class="flex items-stretch gap-2 sm:col-span-2 lg:col-span-1">
+        <div class="flex flex-wrap items-stretch gap-2 sm:col-span-2 lg:col-span-1">
           <label class="flex shrink-0 items-center gap-2 rounded-lg border border-sand-200 bg-white px-3.5 py-2.5 text-sm font-semibold text-ink">
             <input type="checkbox" name="rank" value="true" {% if rank %}checked{% endif %}>
             Rank
@@ -48,8 +49,8 @@
   </div>
   {% endif %}
 
-  <div class="overflow-x-auto">
-    <table class="min-w-full divide-y divide-sand-200 text-left text-sm">
+  <div class="table-frame" role="region" aria-label="Applicant pipeline table; scroll horizontally to see all columns" tabindex="0">
+    <table class="data-table min-w-full divide-y divide-sand-200 text-left text-sm">
       <thead class="bg-sand-100 text-xs font-semibold uppercase tracking-[0.12em] text-ink-soft">
         <tr>
           <th scope="col" class="px-4 py-3">Applicant</th>

@@ -12,7 +12,7 @@
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
   {% include "_dotmac_ui_head.html" %}
   <!-- Compiled Tailwind v3 build + self-hosted fonts (Fraunces/Manrope via @font-face). Bump ?v= on css change. -->
-  <link rel="stylesheet" href="/static/app.css?v=6">
+  <link rel="stylesheet" href="/static/app.css?v=7">
   <script src="/static/htmx.min.js" defer></script>
 </head>
 <body class="min-h-screen bg-sand-100 text-ink antialiased">
@@ -24,7 +24,7 @@
     {% block shell_sidebar %}{% include "shell/_sidebar.html" %}{% endblock %}
 
     <main class="min-w-0 flex-1 px-4 py-8 sm:px-6 sm:py-10">
-      <div class="mx-auto max-w-3xl">
+      <div class="mx-auto w-full {% block content_width %}max-w-3xl{% endblock %}">
 {% else %}
   {# Unauthenticated fallback — base is not normally hit unauthenticated (login is
      standalone), but render a bare <main> so nothing breaks if it ever is. #}

@@ -148,6 +148,10 @@
   --dmui-shadow-xl: 0 2px 4px oklch(0.30 0.06 162 / 0.06), 0 18px 40px -18px oklch(0.30 0.06 162 / 0.28);
   --dmui-focus-ring-color: var(--dmui-color-brand-600);
   --dmui-focus-ring-color-rgb: var(--dmui-color-brand-600-rgb);
+  --academy-shell-offset: 4.25rem;
+  --academy-motion-fast: 140ms;
+  --academy-motion-standard: 180ms;
+  --academy-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 @tailwind base;
@@ -199,19 +203,94 @@
   }
 
   ::selection { background: rgb(var(--dmui-color-brand-500-rgb) / 0.28); }
+
+  * {
+    scrollbar-color: rgb(var(--dmui-color-brand-600-rgb) / 0.55) rgb(var(--dmui-color-semantic-neutral-200-rgb) / 0.8);
+    scrollbar-width: thin;
+  }
 }
 
 @layer components {
   /* Buttons — the portal's primary action face. */
   .btn {
     @apply inline-flex items-center justify-center gap-2 rounded-xl px-5 py-2.5
-           font-sans text-sm font-semibold transition-colors duration-150;
+           min-h-11 font-sans text-sm font-semibold;
+    transition: color var(--academy-motion-fast) var(--academy-ease-out),
+                background-color var(--academy-motion-fast) var(--academy-ease-out),
+                border-color var(--academy-motion-fast) var(--academy-ease-out),
+                box-shadow var(--academy-motion-fast) var(--academy-ease-out),
+                transform var(--academy-motion-fast) var(--academy-ease-out);
   }
   .btn-primary { @apply btn bg-brand-700 text-sand-50 shadow-card hover:bg-brand-800; }
   .btn-ghost   { @apply btn border border-sand-300 bg-sand-50 text-ink hover:border-brand-400 hover:text-brand-700; }
+  .btn:active, .btn-primary:active, .btn-ghost:active { transform: translateY(1px); }
+  .btn:focus-visible, .btn-primary:focus-visible, .btn-ghost:focus-visible {
+    outline: 2px solid var(--dmui-focus-ring-color);
+    outline-offset: 3px;
+  }
+  .btn:disabled, .btn-primary:disabled, .btn-ghost:disabled,
+  .btn[aria-disabled=true], .btn-primary[aria-disabled=true], .btn-ghost[aria-disabled=true] {
+    @apply cursor-not-allowed opacity-50;
+    transform: none;
+  }
 
   /* Surface card. */
   .card { @apply rounded-2xl border border-sand-300 bg-sand-50 shadow-card; }
+
+  /* Operational tables: one deliberate density and a reachable narrow-screen fallback. */
+  .table-frame {
+    @apply relative overflow-auto;
+    overscroll-behavior-inline: contain;
+    scrollbar-gutter: stable;
+    box-shadow: inset -14px 0 18px -20px rgb(var(--dmui-color-semantic-neutral-950-rgb) / 0.55);
+  }
+  .table-frame:focus-visible {
+    outline: 2px solid var(--dmui-focus-ring-color);
+    outline-offset: 3px;
+  }
+  @media (max-width: 639px) {
+    .table-frame[aria-label]::before {
+      content: "Scroll to see all columns";
+      @apply sticky left-0 z-20 block w-full border-b border-sand-200 bg-sand-100 px-3 py-2 text-xs font-semibold text-ink-soft;
+    }
+  }
+  .data-table {
+    @apply w-full text-left text-sm;
+    min-width: 42rem;
+    border-collapse: separate;
+    border-spacing: 0;
+  }
+  .data-table thead { @apply bg-sand-100; }
+  .data-table th {
+    @apply whitespace-nowrap border-b border-sand-300 px-4 py-3 text-xs font-semibold uppercase tracking-[0.1em] text-ink-soft;
+  }
+  .data-table td {
+    @apply border-b border-sand-200 px-4 py-3 align-top leading-5;
+    overflow-wrap: anywhere;
+  }
+  .data-table tbody tr:last-child td { border-bottom-width: 0; }
+  .data-table tbody tr { transition: background-color var(--academy-motion-fast) var(--academy-ease-out); }
+  .data-table tbody tr:nth-child(even) { background: rgb(var(--dmui-color-semantic-neutral-100-rgb) / 0.42); }
+  .data-table tbody tr:hover { background: rgb(var(--dmui-color-brand-50-rgb) / 0.72); }
+  .data-table :is(time, .tabular-nums) { white-space: nowrap; }
+  .data-table :is(button, a):focus-visible {
+    outline: 2px solid var(--dmui-focus-ring-color);
+    outline-offset: 2px;
+  }
+  .matrix-table-frame { max-height: min(70vh, 44rem); }
+  .matrix-table { min-width: max(100%, 52rem); }
+  .matrix-table thead th {
+    @apply sticky top-0 z-20;
+    background: var(--dmui-surface-secondary);
+  }
+  .matrix-table :is(th, td):first-child {
+    @apply sticky left-0 z-10 min-w-52;
+    box-shadow: 8px 0 14px -14px rgb(var(--dmui-color-semantic-neutral-950-rgb) / 0.7);
+  }
+  .matrix-table thead th:first-child { @apply z-30 bg-sand-200; }
+  .matrix-table tbody td:first-child { background: var(--dmui-surface-primary); }
+  .matrix-table tbody tr:nth-child(even) td:first-child { background: var(--dmui-surface-background); }
+  .matrix-table tbody tr:hover td:first-child { background: var(--dmui-color-brand-50); }
 
   /* App shell — role-aware area tabs + contextual sidebar + user menu. */
   .shell-tab {
@@ -228,6 +307,29 @@
   }
   .shell-navlink-active {
     @apply bg-brand-50 font-semibold text-brand-800;
+  }
+  .shell-topbar {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto auto;
+    align-items: center;
+    gap: 0.625rem;
+  }
+  .shell-brand { grid-column: 1; }
+  .shell-area-nav { grid-column: 2 / -1; }
+  .shell-search { grid-column: 1 / 3; grid-row: 2; }
+  .shell-notifications { grid-column: 3; grid-row: 2; }
+  .shell-account { grid-column: 4; grid-row: 2; }
+  .shell-sidebar-nav { top: var(--academy-shell-offset); }
+  .shell-sticky-panel { top: calc(var(--academy-shell-offset) + 1.75rem); }
+  @media (min-width: 640px) {
+    .shell-topbar {
+      grid-template-columns: auto minmax(0, 1fr) auto auto auto;
+      gap: 1rem;
+    }
+    .shell-area-nav { grid-column: 2; }
+    .shell-search { grid-column: 3; grid-row: 1; }
+    .shell-notifications { grid-column: 4; grid-row: 1; }
+    .shell-account { grid-column: 5; grid-row: 1; }
   }
 
   /* User menu disclosure (details/summary) — strip the native marker. */
@@ -256,10 +358,13 @@
     margin-left: calc(50% - min(calc(100vw - 2rem), 64rem) / 2);
   }
   .coursework-shell { @apply grid gap-6 lg:grid-cols-[22rem_minmax(0,1fr)] lg:items-start; }
-  .coursework-sidebar { @apply grid gap-4 lg:sticky lg:top-[5.5rem] lg:max-h-[calc(100vh-6.5rem)] lg:overflow-hidden; }
+  .coursework-sidebar {
+    @apply grid gap-4 lg:sticky lg:max-h-[calc(100vh-5.25rem)] lg:overflow-y-auto lg:pr-1;
+    top: var(--academy-shell-offset);
+  }
   .coursework-menu { @apply rounded-2xl border border-sand-300 bg-sand-50 p-2 shadow-card; }
   .coursework-panel { @apply rounded-2xl border border-sand-300 bg-sand-50 p-4 shadow-card; }
-  .coursework-scroll { @apply lg:max-h-[calc(100vh-23rem)] lg:overflow-y-auto; }
+  .coursework-scroll { @apply lg:overflow-y-visible; }
   .coursework-main { @apply min-w-0 space-y-5; }
   .coursework-hero { @apply relative min-h-56 overflow-hidden rounded-2xl bg-brand-800 shadow-lift; }
   .coursework-hero::after { content: ""; @apply absolute inset-0 bg-gradient-to-r from-brand-900/95 via-brand-900/70 to-brand-700/35; }
@@ -273,7 +378,7 @@
   .coursework-chapter-link-active { @apply border-brand-600 bg-brand-50 text-brand-800; }
   .coursework-subtopics { @apply ml-3 mt-1 grid gap-0.5 border-l border-sand-300 pl-3; }
   .coursework-subtopic-link { @apply flex items-start gap-2 rounded-md px-2 py-1 text-xs font-medium leading-5 text-ink-soft transition-colors hover:bg-sand-200 hover:text-brand-700; }
-  .coursework-subtopic-title { @apply min-w-0 flex-1 whitespace-nowrap; }
+  .coursework-subtopic-title { @apply min-w-0 flex-1 break-words; }
   .coursework-subtopic-check { @apply hidden shrink-0 text-brand-700; }
   .coursework-subtopic-link-current { @apply text-ink; }
   .coursework-subtopic-active { @apply bg-sand-200 text-brand-800 ring-1 ring-brand-200; }
@@ -306,7 +411,14 @@
   }
   .prose pre code { background: transparent; padding: 0; color: inherit; }
   .prose img { border-radius: 0.75rem; border: 1px solid var(--dmui-border-default); }
-  .prose table { border-collapse: collapse; width: 100%; font-size: 0.95rem; }
+  .prose table {
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    overflow-x: auto;
+    border-collapse: collapse;
+    font-size: 0.95rem;
+  }
   .prose th, .prose td { border: 1px solid var(--dmui-border-default); padding: 0.5rem 0.7rem; text-align: left; }
   .prose blockquote {
     border-left: 3px solid var(--dmui-color-brand-400);
@@ -318,7 +430,7 @@
    these classes are added at runtime by JS and would be purged otherwise. */
 
 /* heading anchor links */
-.prose h2, .prose h3 { scroll-margin-top: 5rem; }
+.prose h2, .prose h3 { scroll-margin-top: calc(var(--academy-shell-offset) + 0.75rem); }
 .heading-anchor {
   margin-left: 0.4rem; color: var(--dmui-color-brand-400); opacity: 0;
   text-decoration: none; font-weight: 400; transition: opacity .15s;
@@ -363,3 +475,12 @@
 }
 .prose pre:hover .code-copy { opacity: 1; }
 .code-copy:hover { background: rgb(var(--dmui-color-semantic-neutral-50-rgb) / 0.24); }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

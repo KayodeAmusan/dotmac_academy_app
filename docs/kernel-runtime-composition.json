@@ -18,9 +18,9 @@
     {
       "id": "dependency-lock",
       "source_path": "poetry.lock",
-      "source_blob_sha256": "a8bdb6313b481d8e4a55fb0f653aa9529c37148d75fb50b9ccfc37e3b55ff03c",
+      "source_blob_sha256": "624ee61c0754582ffc8681f2933f9ac612a9a8f86d6c2652baaaba60dc1e1342",
       "selector": "whole-file.v1",
-      "extract_sha256": "a8bdb6313b481d8e4a55fb0f653aa9529c37148d75fb50b9ccfc37e3b55ff03c"
+      "extract_sha256": "624ee61c0754582ffc8681f2933f9ac612a9a8f86d6c2652baaaba60dc1e1342"
     },
     {
       "id": "production-install",
