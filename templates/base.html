@@ -24,7 +24,7 @@
     {% block shell_sidebar %}{% include "shell/_sidebar.html" %}{% endblock %}
 
     <main id="main-content" class="shell-main min-w-0 flex-1 px-4 py-7 sm:px-7 sm:py-9 lg:px-10">
-      <div class="mx-auto w-full {% block content_width %}max-w-5xl{% endblock %}">
+      <div class="mx-auto w-full {% block content_width %}max-w-[1360px]{% endblock %}">
 {% else %}
   {# Unauthenticated fallback — base is not normally hit unauthenticated (login is
      standalone), but render a bare <main> so nothing breaks if it ever is. #}
