@@ -1,13 +1,14 @@
 {% extends "base.html" %}
+{% block content_width %}max-w-5xl{% endblock %}
 {% block title %}Reminders — {{ branding_name | default("Dotmac Academy") }}{% endblock %}
 {% block content %}
 <p class="font-sans text-sm font-semibold uppercase tracking-[0.16em] text-brand-600">Administration</p>
 <h1 class="mt-1.5 text-3xl tracking-tight">Reminder history</h1>
 <p class="mt-2 text-ink-soft">Every reminder decision the policy service has recorded, with email delivery evidence from the outbox.</p>
 
-<div class="card mt-8 overflow-x-auto">
+<div class="card table-frame mt-8" role="region" aria-label="Reminder delivery table; scroll horizontally to see all columns" tabindex="0">
   {% if rows %}
-  <table class="w-full text-sm">
+  <table class="data-table">
     <thead>
       <tr class="border-b border-sand-200 text-left text-ink-soft">
         <th class="px-4 py-3">When</th>

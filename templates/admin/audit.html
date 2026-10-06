@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% block content_width %}max-w-5xl{% endblock %}
 {% block title %}Audit log — {{ branding_name | default("Technical Academy") }}{% endblock %}
 {% block content %}
 <p class="font-sans text-sm font-semibold uppercase tracking-[0.16em] text-brand-600">Administration</p>
@@ -24,9 +25,9 @@
   {% endif %}
 </form>
 
-<div class="card mt-6 overflow-x-auto">
+<div class="card table-frame mt-6" role="region" aria-label="Audit events table; scroll horizontally to see all columns" tabindex="0">
   {% if events %}
-  <table class="w-full text-sm">
+  <table class="data-table">
     <thead>
       <tr class="border-b border-sand-200">
         <th class="px-4 py-3 text-left font-semibold text-ink-soft">Time</th>
