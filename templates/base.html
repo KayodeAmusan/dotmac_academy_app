@@ -12,10 +12,12 @@
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
   {% include "_dotmac_ui_head.html" %}
   <!-- Compiled Tailwind v3 build + self-hosted Academic Modernist fonts. Bump ?v= on css change. -->
-  <link rel="stylesheet" href="/static/app.css?v=8">
+  <link rel="stylesheet" href="/static/app.css?v=9">
   <script src="/static/htmx.min.js" defer></script>
 </head>
 <body class="min-h-screen bg-sand-100 text-ink antialiased">
+
+  <a class="skip-link" href="#main-content">Skip to main content</a>
 
 {% if current_person %}
   {% include "shell/_topbar.html" %}
@@ -28,7 +30,7 @@
 {% else %}
   {# Unauthenticated fallback — base is not normally hit unauthenticated (login is
      standalone), but render a bare <main> so nothing breaks if it ever is. #}
-  <main class="mx-auto max-w-3xl px-6 py-10 sm:py-12">
+  <main id="main-content" class="mx-auto max-w-3xl px-6 py-10 sm:py-12">
 {% endif %}
 
         {% block content %}{% endblock %}
@@ -116,6 +118,40 @@
       });
       window.addEventListener('resize', function () { setSidebar(false, false); });
       setSidebar(false, false);
+    }());
+    (function () {
+      var academySearch = document.querySelector('.shell-search input[type="search"]');
+      if (!academySearch) return;
+      document.addEventListener('keydown', function (event) {
+        if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+          event.preventDefault();
+          academySearch.focus();
+          academySearch.select();
+        }
+      });
+    }());
+    (function () {
+      var liveSelector = '[id*="result"], [id$="-flash"], [id*="-error"]';
+      function prepareRegion(region) {
+        if (!region.hasAttribute('role')) region.setAttribute('role', 'status');
+        if (!region.hasAttribute('aria-live')) region.setAttribute('aria-live', 'polite');
+        region.setAttribute('aria-atomic', 'true');
+      }
+      function prepareLiveRegions(root) {
+        if (root.matches && root.matches(liveSelector)) prepareRegion(root);
+        var regions = root.querySelectorAll ? root.querySelectorAll(liveSelector) : [];
+        regions.forEach(prepareRegion);
+      }
+      prepareLiveRegions(document);
+      document.body.addEventListener('htmx:beforeRequest', function (event) {
+        event.detail.elt.setAttribute('aria-busy', 'true');
+      });
+      document.body.addEventListener('htmx:afterRequest', function (event) {
+        event.detail.elt.removeAttribute('aria-busy');
+      });
+      document.body.addEventListener('htmx:afterSwap', function (event) {
+        prepareLiveRegions(event.detail.target || document);
+      });
     }());
   </script>
 </body>

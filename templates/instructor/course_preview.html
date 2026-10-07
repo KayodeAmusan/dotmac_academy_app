@@ -33,7 +33,7 @@
     </nav>
   </aside>
 
-  <main class="min-w-0">
+  <div class="min-w-0">
     <section class="coursework-hero">
       <img src="/static/img/cover-{{ course.slug }}.webp" alt="" class="coursework-hero-img" loading="lazy" onerror="this.style.display='none'">
       <div class="coursework-hero-content">
@@ -63,7 +63,7 @@
       <a class="btn-primary" href="/instructor/courses/{{ course.id }}/preview/chapters/{{ next_chapter.number }}">Chapter {{ next_chapter.number }} <span aria-hidden="true">&rarr;</span></a>
       {% endif %}
     </nav>
-  </main>
+  </div>
 </div>
 {% else %}
 <div class="card mt-8 p-8 text-center text-ink-soft">No chapters have been added to this course yet.</div>
